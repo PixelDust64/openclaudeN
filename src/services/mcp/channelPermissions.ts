@@ -83,30 +83,7 @@ const ID_ALPHABET = 'abcdefghijkmnopqrstuvwxyz'
 // tier. If a generated ID contains any of these, re-hash with a salt.
 // prettier-ignore
 const ID_AVOID_SUBSTRINGS = [
-  'fuck',
-  'shit',
-  'cunt',
-  'cock',
-  'dick',
-  'twat',
-  'piss',
-  'crap',
-  'bitch',
-  'whore',
-  'ass',
-  'tit',
-  'cum',
-  'fag',
   'dyke',
-  'nig',
-  'kike',
-  'rape',
-  'nazi',
-  'damn',
-  'poo',
-  'pee',
-  'wank',
-  'anus',
 ]
 
 function hashToId(input: string): string {
