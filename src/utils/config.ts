@@ -31,6 +31,7 @@ import { normalizePathForConfigKey } from './path.js'
 import { getEssentialTrafficOnlyReason } from './privacyLevel.js'
 import { getManagedFilePath } from './settings/managedPath.js'
 import type { ThemeSetting } from './theme.js'
+import { PRIMARY_PROJECT_INSTRUCTION_FILE } from './projectInstructions.js'
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const teamMemPaths = feature('TEAMMEM')
@@ -154,7 +155,7 @@ export {
   NOTIFICATION_CHANNELS,
 } from './configConstants.js'
 
-import type { EDITOR_MODES, NOTIFICATION_CHANNELS } from './configConstants.js'
+import type { EDITOR_MODES, NOTIFICATION_CHANNELS, PROVIDERS } from './configConstants.js'
 
 export type NotificationChannel = (typeof NOTIFICATION_CHANNELS)[number]
 
@@ -180,10 +181,12 @@ export type DiffTool = 'terminal' | 'auto'
 
 export type OutputStyle = string
 
+export type Providers = typeof PROVIDERS[number]
+
 export type ProviderProfile = {
   id: string
   name: string
-  provider: 'openai' | 'anthropic'
+  provider: Providers
   baseUrl: string
   model: string
   apiKey?: string
@@ -576,6 +579,7 @@ export type GlobalConfig = {
 
   // Additional model options for the model picker (fetched during bootstrap).
   additionalModelOptionsCache?: ModelOption[]
+  additionalModelOptionsCacheScope?: string
 
   // Additional model options discovered from OpenAI-compatible endpoints.
   openaiAdditionalModelOptionsCache?: ModelOption[]
@@ -1822,7 +1826,7 @@ export function getMemoryPath(memoryType: MemoryType): string {
     case 'Local':
       return join(cwd, 'CLAUDE.local.md')
     case 'Project':
-      return join(cwd, 'CLAUDE.md')
+      return join(cwd, PRIMARY_PROJECT_INSTRUCTION_FILE)
     case 'Managed':
       return join(getManagedFilePath(), 'CLAUDE.md')
     case 'AutoMem':

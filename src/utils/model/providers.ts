@@ -1,5 +1,5 @@
 import type { AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS } from '../../services/analytics/index.js'
-import { isCodexAlias } from '../../services/api/providerConfig.js'
+import { shouldUseCodexTransport } from '../../services/api/providerConfig.js'
 import { isEnvTruthy } from '../envUtils.js'
 
 export type APIProvider =
@@ -11,10 +11,22 @@ export type APIProvider =
   | 'gemini'
   | 'github'
   | 'codex'
+  | 'nvidia-nim'
+  | 'minimax'
+  | 'mistral'
 
 export function getAPIProvider(): APIProvider {
+  if (isEnvTruthy(process.env.NVIDIA_NIM)) {
+    return 'nvidia-nim'
+  }
+  if (isEnvTruthy(process.env.MINIMAX_API_KEY)) {
+    return 'minimax'
+  }
   return isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI)
     ? 'gemini'
+    :
+    isEnvTruthy(process.env.CLAUDE_CODE_USE_MISTRAL)
+    ? 'mistral'
     : isEnvTruthy(process.env.CLAUDE_CODE_USE_GITHUB)
       ? 'github'
       : isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENAI)
@@ -34,11 +46,10 @@ export function usesAnthropicAccountFlow(): boolean {
   return getAPIProvider() === 'firstParty'
 }
 function isCodexModel(): boolean {
-  const model = (process.env.OPENAI_MODEL || '').trim()
-  if (!model) return false
-  // Delegate to the canonical alias table in providerConfig to keep
-  // the two Codex detection systems (provider type + transport) in sync.
-  return isCodexAlias(model)
+  return shouldUseCodexTransport(
+    process.env.OPENAI_MODEL || '',
+    process.env.OPENAI_BASE_URL ?? process.env.OPENAI_API_BASE,
+  )
 }
 
 export function getAPIProviderForStatsig(): AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS {
