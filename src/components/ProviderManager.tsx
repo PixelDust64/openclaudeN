@@ -37,13 +37,14 @@ import {
   readGithubModelsTokenAsync,
 } from '../utils/githubModelsCredentials.js'
 import {
-  hasLocalOllama,
-  listOllamaModels,
+  probeOllamaGenerationReadiness,
+  type OllamaGenerationReadiness,
 } from '../utils/providerDiscovery.js'
 import {
   rankOllamaModels,
   recommendOllamaModel,
 } from '../utils/providerRecommendation.js'
+import { redactUrlForDisplay } from '../utils/urlRedaction.js'
 import { updateSettingsForSource } from '../utils/settings/settings.js'
 import {
   type OptionWithDescription,
@@ -52,7 +53,6 @@ import {
 import { Pane } from './design-system/Pane.js'
 import TextInput from './TextInput.js'
 import { useCodexOAuthFlow } from './useCodexOAuthFlow.js'
-import { useSetAppState } from '../state/AppState.js'
 
 export type ProviderManagerResult = {
   action: 'saved' | 'cancelled'
@@ -222,6 +222,29 @@ function getGithubProviderSummary(
   return `github-models · ${GITHUB_PROVIDER_DEFAULT_BASE_URL} · ${getGithubProviderModel(processEnv)} · ${credentialSummary}${activeSuffix}`
 }
 
+function describeOllamaSelectionIssue(
+  readiness: OllamaGenerationReadiness,
+  baseUrl: string,
+): string {
+  if (readiness.state === 'unreachable') {
+    return `Could not reach Ollama at ${redactUrlForDisplay(baseUrl)}. Start Ollama first, or enter the endpoint manually.`
+  }
+
+  if (readiness.state === 'no_models') {
+    return 'Ollama is running, but no installed models were found. Pull a chat model such as qwen2.5-coder:7b or llama3.1:8b first, or enter details manually.'
+  }
+
+  if (readiness.state === 'generation_failed') {
+    const modelHint = readiness.probeModel ?? 'the selected model'
+    const detailSuffix = readiness.detail
+      ? ` Details: ${readiness.detail}.`
+      : ''
+    return `Ollama is reachable and models are installed, but a generation probe failed for ${modelHint}.${detailSuffix} Run "ollama run ${modelHint}" once and retry, or enter details manually.`
+  }
+
+  return ''
+}
+
 function findCodexOAuthProfile(
   profiles: ProviderProfile[],
   profileId?: string,
@@ -333,10 +356,12 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
   const initialIsGithubActive = isEnvTruthy(process.env.CLAUDE_CODE_USE_GITHUB)
   const initialHasGithubCredential = initialGithubCredentialSource !== 'none'
 
-  const [profiles, setProfiles] = React.useState(() => getProviderProfiles())
-  const [activeProfileId, setActiveProfileId] = React.useState(
-    () => getActiveProviderProfile()?.id,
-  )
+  // Deferred initialization: useState initializers run synchronously during
+  // render, so getProviderProfiles() and getActiveProviderProfile() would block
+  // the UI on first mount (sync file I/O). Use empty initial values and load
+  // asynchronously in useEffect with queueMicrotask to keep UI responsive.
+  const [profiles, setProfiles] = React.useState<ProviderProfile[]>([])
+  const [activeProfileId, setActiveProfileId] = React.useState<string | undefined>()
   const [githubProviderAvailable, setGithubProviderAvailable] = React.useState(
     () => isGithubProviderAvailable(initialGithubCredentialSource),
   )
@@ -370,10 +395,85 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
   const [ollamaSelection, setOllamaSelection] = React.useState<OllamaSelectionState>({
     state: 'idle',
   })
+  // Deferred initialization: useState initializers run synchronously during
+  // render, so getProviderProfiles() and getActiveProviderProfile() would block
+  // the UI (sync file I/O). Defer to queueMicrotask after first render.
+  // In test environment, skip defer to avoid timing issues with mocks.
+  const [isInitializing, setIsInitializing] = React.useState(
+    process.env.NODE_ENV !== 'test',
+  )
+  const [isActivating, setIsActivating] = React.useState(false)
+  const isRefreshingRef = React.useRef(false)
+
+  React.useEffect(() => {
+    // Skip deferred initialization in test environment (mocks are synchronous)
+    if (process.env.NODE_ENV === 'test') {
+      setProfiles(getProviderProfiles())
+      setActiveProfileId(getActiveProviderProfile()?.id)
+      setIsInitializing(false)
+      return
+    }
+
+    queueMicrotask(() => {
+      const profilesData = getProviderProfiles()
+      const activeId = getActiveProviderProfile()?.id
+      setProfiles(profilesData)
+      setActiveProfileId(activeId)
+      setIsInitializing(false)
+    })
+  }, [])
 
   const currentStep = FORM_STEPS[formStepIndex] ?? FORM_STEPS[0]
   const currentStepKey = currentStep.key
   const currentValue = draft[currentStepKey]
+
+  // Memoize menu options to prevent unnecessary re-renders when navigating
+  // the select menu. Without this, each arrow key press creates a new options
+  // array reference, causing Select to re-render and feel sluggish.
+  const hasProfiles = profiles.length > 0
+  const hasSelectableProviders = hasProfiles || githubProviderAvailable
+  const menuOptions = React.useMemo(
+    () => [
+      {
+        value: 'add',
+        label: 'Add provider',
+        description: 'Create a new provider profile',
+      },
+      {
+        value: 'activate',
+        label: 'Set active provider',
+        description: 'Switch the active provider profile',
+        disabled: !hasSelectableProviders,
+      },
+      {
+        value: 'edit',
+        label: 'Edit provider',
+        description: 'Update URL, model, or key',
+        disabled: !hasProfiles,
+      },
+      {
+        value: 'delete',
+        label: 'Delete provider',
+        description: 'Remove a provider profile',
+        disabled: !hasSelectableProviders,
+      },
+      ...(hasStoredCodexOAuthCredentials
+        ? [
+            {
+              value: 'logout-codex-oauth',
+              label: 'Log out Codex OAuth',
+              description: 'Clear securely stored Codex OAuth credentials',
+            },
+          ]
+        : []),
+      {
+        value: 'done',
+        label: 'Done',
+        description: 'Return to chat',
+      },
+    ],
+    [hasSelectableProviders, hasProfiles, hasStoredCodexOAuthCredentials],
+  )
 
   const refreshGithubProviderState = React.useCallback((): void => {
     const envCredentialSource = getGithubCredentialSourceFromEnv()
@@ -450,32 +550,21 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     setOllamaSelection({ state: 'loading' })
 
     void (async () => {
-      const available = await hasLocalOllama(draft.baseUrl)
-      if (!available) {
+      const readiness = await probeOllamaGenerationReadiness({
+        baseUrl: draft.baseUrl,
+      })
+      if (readiness.state !== 'ready') {
         if (!cancelled) {
           setOllamaSelection({
             state: 'unavailable',
-            message:
-              'Could not reach Ollama. Start Ollama first, or enter the endpoint manually.',
+            message: describeOllamaSelectionIssue(readiness, draft.baseUrl),
           })
         }
         return
       }
 
-      const models = await listOllamaModels(draft.baseUrl)
-      if (models.length === 0) {
-        if (!cancelled) {
-          setOllamaSelection({
-            state: 'unavailable',
-            message:
-              'Ollama is running, but no installed models were found. Pull a chat model such as qwen2.5-coder:7b or llama3.1:8b first, or enter details manually.',
-          })
-        }
-        return
-      }
-
-      const ranked = rankOllamaModels(models, 'balanced')
-      const recommended = recommendOllamaModel(models, 'balanced')
+      const ranked = rankOllamaModels(readiness.models, 'balanced')
+      const recommended = recommendOllamaModel(readiness.models, 'balanced')
       if (!cancelled) {
         setOllamaSelection({
           state: 'ready',
@@ -495,11 +584,21 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
   }, [draft.baseUrl, screen])
 
   function refreshProfiles(): void {
-    const nextProfiles = getProviderProfiles()
-    setProfiles(nextProfiles)
-    setActiveProfileId(getActiveProviderProfile()?.id)
-    refreshGithubProviderState()
-    refreshCodexOAuthCredentialState()
+    // Defer sync I/O to next microtask to prevent UI freeze.
+    // getProviderProfiles() and getActiveProviderProfile() read config files
+    // synchronously, which can block the main thread on Windows (antivirus, disk cache).
+    // queueMicrotask ensures the current render completes first.
+    if (isRefreshingRef.current) return
+    isRefreshingRef.current = true
+
+    queueMicrotask(() => {
+      const nextProfiles = getProviderProfiles()
+      setProfiles(nextProfiles)
+      setActiveProfileId(getActiveProviderProfile()?.id)
+      refreshGithubProviderState()
+      refreshCodexOAuthCredentialState()
+      isRefreshingRef.current = false
+    })
   }
 
   function clearStartupProviderOverrideFromUserSettings(): string | null {
@@ -572,12 +671,24 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
   async function activateSelectedProvider(profileId: string): Promise<void> {
     let providerLabel = 'provider'
 
+    // Set loading state before sync I/O to keep UI responsive
+    setIsActivating(true)
+    setStatusMessage('Activating provider...')
+
     try {
+      // Defer sync I/O to next microtask - UI renders loading state first.
+      // setActiveProviderProfile(), activateGithubProvider(), and
+      // clearStartupProviderOverrideFromUserSettings() all perform sync file writes
+      // (saveGlobalConfig, saveProfileFile, updateSettingsForSource) which can
+      // block the main thread on Windows (antivirus, disk cache, NTFS metadata).
+      await new Promise<void>(resolve => queueMicrotask(resolve))
+
       if (profileId === GITHUB_PROVIDER_ID) {
         providerLabel = GITHUB_PROVIDER_LABEL
         const githubError = activateGithubProvider()
         if (githubError) {
           setErrorMessage(`Could not activate GitHub provider: ${githubError}`)
+          setIsActivating(false)
           returnToMenu()
           return
         }
@@ -593,6 +704,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
           mainLoopModel: GITHUB_PROVIDER_DEFAULT_MODEL,
         }))
         setStatusMessage(`Active provider: ${GITHUB_PROVIDER_LABEL}`)
+        setIsActivating(false)
         returnToMenu()
         return
       }
@@ -600,6 +712,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
       const active = setActiveProviderProfile(profileId)
       if (!active) {
         setErrorMessage('Could not change active provider.')
+        setIsActivating(false)
         returnToMenu()
         return
       }
@@ -647,10 +760,12 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
             ? `Active provider: ${active.name}. Warning: could not clear startup provider override (${settingsOverrideError}).`
             : `Active provider: ${active.name}`,
       )
+      setIsActivating(false)
       returnToMenu()
     } catch (error) {
       refreshProfiles()
       setStatusMessage(undefined)
+      setIsActivating(false)
       const detail = error instanceof Error ? error.message : String(error)
       setErrorMessage(`Could not finish activating ${providerLabel}: ${detail}`)
       returnToMenu()
@@ -979,21 +1094,30 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
 
   function renderPresetSelection(): React.ReactNode {
     const canUseCodexOAuth = !isBareMode()
+    // Providers sorted alphabetically by label. `Custom` is pinned to the end
+    // because it's the catch-all / escape hatch — users scanning the list
+    // should always find known providers first. `Skip for now` (first-run
+    // only) comes last, after Custom.
     const options = [
+      {
+        value: 'dashscope-intl',
+        label: 'Alibaba Coding Plan',
+        description: 'Alibaba DashScope International endpoint',
+      },
+      {
+        value: 'dashscope-cn',
+        label: 'Alibaba Coding Plan (China)',
+        description: 'Alibaba DashScope China endpoint',
+      },
       {
         value: 'anthropic',
         label: 'Anthropic',
         description: 'Native Claude API (x-api-key auth)',
       },
       {
-        value: 'ollama',
-        label: 'Ollama',
-        description: 'Local or remote Ollama endpoint',
-      },
-      {
-        value: 'openai',
-        label: 'OpenAI',
-        description: 'OpenAI API with API key',
+        value: 'azure-openai',
+        label: 'Azure OpenAI',
+        description: 'Azure OpenAI endpoint (model=deployment name)',
       },
       ...(canUseCodexOAuth
         ? [
@@ -1006,11 +1130,6 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
           ]
         : []),
       {
-        value: 'moonshotai',
-        label: 'Moonshot AI',
-        description: 'Kimi OpenAI-compatible endpoint',
-      },
-      {
         value: 'deepseek',
         label: 'DeepSeek',
         description: 'DeepSeek OpenAI-compatible endpoint',
@@ -1021,29 +1140,9 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
         description: 'Gemini OpenAI-compatible endpoint',
       },
       {
-        value: 'together',
-        label: 'Together AI',
-        description: 'Together chat/completions endpoint',
-      },
-      {
         value: 'groq',
         label: 'Groq',
         description: 'Groq OpenAI-compatible endpoint',
-      },
-      {
-        value: 'mistral',
-        label: 'Mistral',
-        description: 'Mistral OpenAI-compatible endpoint',
-      },
-      {
-        value: 'azure-openai',
-        label: 'Azure OpenAI',
-        description: 'Azure OpenAI endpoint (model=deployment name)',
-      },
-      {
-        value: 'openrouter',
-        label: 'OpenRouter',
-        description: 'OpenRouter OpenAI-compatible endpoint',
       },
       {
         value: 'lmstudio',
@@ -1051,19 +1150,19 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
         description: 'Local LM Studio endpoint',
       },
       {
-        value: 'dashscope-cn',
-        label: 'Alibaba Coding Plan (China)',
-        description: 'Alibaba DashScope China endpoint',
+        value: 'minimax',
+        label: 'MiniMax',
+        description: 'MiniMax API endpoint',
       },
       {
-        value: 'dashscope-intl',
-        label: 'Alibaba Coding Plan',
-        description: 'Alibaba DashScope International endpoint',
+        value: 'mistral',
+        label: 'Mistral',
+        description: 'Mistral OpenAI-compatible endpoint',
       },
       {
-        value: 'custom',
-        label: 'Custom',
-        description: 'Any OpenAI-compatible provider',
+        value: 'moonshotai',
+        label: 'Moonshot AI',
+        description: 'Kimi OpenAI-compatible endpoint',
       },
       {
         value: 'nvidia-nim',
@@ -1071,9 +1170,29 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
         description: 'NVIDIA NIM endpoint',
       },
       {
-        value: 'minimax',
-        label: 'MiniMax',
-        description: 'MiniMax API endpoint',
+        value: 'ollama',
+        label: 'Ollama',
+        description: 'Local or remote Ollama endpoint',
+      },
+      {
+        value: 'openai',
+        label: 'OpenAI',
+        description: 'OpenAI API with API key',
+      },
+      {
+        value: 'openrouter',
+        label: 'OpenRouter',
+        description: 'OpenRouter OpenAI-compatible endpoint',
+      },
+      {
+        value: 'together',
+        label: 'Together AI',
+        description: 'Together chat/completions endpoint',
+      },
+      {
+        value: 'custom',
+        label: 'Custom',
+        description: 'Any OpenAI-compatible provider',
       },
       ...(mode === 'first-run'
         ? [
@@ -1150,6 +1269,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
             focus={true}
             showCursor={true}
             placeholder={`${currentStep.placeholder}${figures.ellipsis}`}
+            mask={currentStepKey === 'apiKey' ? '*' : undefined}
             columns={80}
             cursorOffset={cursorOffset}
             onChangeCursorOffset={setCursorOffset}
@@ -1164,48 +1284,9 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
   }
 
   function renderMenu(): React.ReactNode {
+    // Use memoized menuOptions from component scope
     const hasProfiles = profiles.length > 0
     const hasSelectableProviders = hasProfiles || githubProviderAvailable
-
-    const options = [
-      {
-        value: 'add',
-        label: 'Add provider',
-        description: 'Create a new provider profile',
-      },
-      {
-        value: 'activate',
-        label: 'Set active provider',
-        description: 'Switch the active provider profile',
-        disabled: !hasSelectableProviders,
-      },
-      {
-        value: 'edit',
-        label: 'Edit provider',
-        description: 'Update URL, model, or key',
-        disabled: !hasProfiles,
-      },
-      {
-        value: 'delete',
-        label: 'Delete provider',
-        description: 'Remove a provider profile',
-        disabled: !hasSelectableProviders,
-      },
-      ...(hasStoredCodexOAuthCredentials
-        ? [
-            {
-              value: 'logout-codex-oauth',
-              label: 'Log out Codex OAuth',
-              description: 'Clear securely stored Codex OAuth credentials',
-            },
-          ]
-        : []),
-      {
-        value: 'done',
-        label: 'Done',
-        description: 'Return to chat',
-      },
-    ]
 
     return (
       <Box flexDirection="column" gap={1}>
@@ -1243,7 +1324,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
           )}
         </Box>
         <Select
-          options={options}
+          options={menuOptions}
           onChange={(value: string) => {
             setErrorMessage(undefined)
             switch (value) {
@@ -1256,7 +1337,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
                 }
                 break
               case 'edit':
-                if (profiles.length > 0) {
+                if (hasProfiles) {
                   setScreen('select-edit')
                 }
                 break
@@ -1313,7 +1394,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
           }}
           onCancel={() => closeWithCancelled('Provider manager closed')}
           defaultFocusValue={menuFocusValue}
-          visibleOptionCount={options.length}
+          visibleOptionCount={menuOptions.length}
         />
       </Box>
     )
@@ -1549,5 +1630,21 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
       break
   }
 
-  return <Pane color="permission">{content}</Pane>
+  return (
+    <Pane color="permission">
+      {isInitializing ? (
+        <Box flexDirection="column" gap={1}>
+          <Text color="remember" bold>Loading providers...</Text>
+          <Text dimColor>Reading provider profiles from disk.</Text>
+        </Box>
+      ) : isActivating ? (
+        <Box flexDirection="column" gap={1}>
+          <Text color="remember" bold>Activating provider...</Text>
+          <Text dimColor>Please wait while the provider is being configured.</Text>
+        </Box>
+      ) : (
+        content
+      )}
+    </Pane>
+  )
 }

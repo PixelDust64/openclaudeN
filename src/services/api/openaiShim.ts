@@ -32,10 +32,9 @@ import { resolveGeminiCredential } from '../../utils/geminiAuth.js'
 import { hydrateGeminiAccessTokenFromSecureStorage } from '../../utils/geminiCredentials.js'
 import { hydrateGithubModelsTokenFromSecureStorage } from '../../utils/githubModelsCredentials.js'
 import {
-  looksLikeLeakedReasoningPrefix,
-  shouldBufferPotentialReasoningPrefix,
-  stripLeakedReasoningPreamble,
-} from './reasoningLeakSanitizer.js'
+  createThinkTagFilter,
+  stripThinkTags,
+} from './thinkTagSanitizer.js'
 import {
   codexStreamToAnthropic,
   collectCodexCompletedResponse,
@@ -47,12 +46,15 @@ import {
   type AnthropicUsage,
   type ShimCreateParams,
 } from './codexShim.js'
+import { compressToolHistory } from './compressToolHistory.js'
 import { fetchWithProxyRetry } from './fetchWithProxyRetry.js'
 import {
+  getLocalProviderRetryBaseUrls,
+  getGithubEndpointType,
   isLocalProviderUrl,
   resolveRuntimeCodexCredentials,
   resolveProviderRequest,
-  getGithubEndpointType,
+  shouldAttemptLocalToollessRetry,
 } from './providerConfig.js'
 import {
   buildOpenAICompatibilityErrorMessage,
@@ -80,6 +82,10 @@ const GITHUB_429_MAX_RETRIES = 3
 const GITHUB_429_BASE_DELAY_SEC = 1
 const GITHUB_429_MAX_DELAY_SEC = 32
 const GEMINI_API_HOST = 'generativelanguage.googleapis.com'
+const MOONSHOT_API_HOSTS = new Set([
+  'api.moonshot.ai',
+  'api.moonshot.cn',
+])
 
 const COPILOT_HEADERS: Record<string, string> = {
   'User-Agent': 'GitHubCopilotChat/0.26.7',
@@ -140,6 +146,15 @@ function hasGeminiApiHost(baseUrl: string | undefined): boolean {
 
   try {
     return new URL(baseUrl).hostname.toLowerCase() === GEMINI_API_HOST
+  } catch {
+    return false
+  }
+}
+
+function isMoonshotBaseUrl(baseUrl: string | undefined): boolean {
+  if (!baseUrl) return false
+  try {
+    return MOONSHOT_API_HOSTS.has(new URL(baseUrl).hostname.toLowerCase())
   } catch {
     return false
   }
@@ -276,6 +291,15 @@ function convertToolResultContent(
     const text = parts[0].text ?? ''
     return isError ? `Error: ${text}` : text
   }
+
+  // Collapse arrays of only text blocks into a single string for DeepSeek
+  // compatibility (issue #774). DeepSeek rejects arrays in role: "tool" messages.
+  const allText = parts.every(p => p.type === 'text')
+  if (allText) {
+    const text = parts.map(p => p.text ?? '').join('\n\n')
+    return isError ? `Error: ${text}` : text
+  }
+
   if (isError && parts[0]?.type === 'text') {
     parts[0] = { ...parts[0], text: `Error: ${parts[0].text ?? ''}` }
   } else if (isError) {
@@ -334,6 +358,14 @@ function convertContentBlocks(
 
   if (parts.length === 0) return ''
   if (parts.length === 1 && parts[0].type === 'text') return parts[0].text ?? ''
+
+  // Collapse arrays of only text blocks into a single string for DeepSeek
+  // compatibility (issue #774).
+  const allText = parts.every(p => p.type === 'text')
+  if (allText) {
+    return parts.map(p => p.text ?? '').join('\n\n')
+  }
+
   return parts
 }
 
@@ -345,11 +377,32 @@ function isGeminiMode(): boolean {
 }
 
 function convertMessages(
-  messages: Array<{ role: string; message?: { role?: string; content?: unknown }; content?: unknown }>,
+  messages: Array<{
+    role: string
+    message?: { role?: string; content?: unknown }
+    content?: unknown
+  }>,
   system: unknown,
 ): OpenAIMessage[] {
   const result: OpenAIMessage[] = []
   const knownToolCallIds = new Set<string>()
+
+  // Pre-scan for all tool results in the history to identify valid tool calls
+  const toolResultIds = new Set<string>()
+  for (const msg of messages) {
+    const inner = msg.message ?? msg
+    const content = (inner as { content?: unknown }).content
+    if (Array.isArray(content)) {
+      for (const block of content) {
+        if (
+          (block as { type?: string }).type === 'tool_result' &&
+          (block as { tool_use_id?: string }).tool_use_id
+        ) {
+          toolResultIds.add((block as { tool_use_id: string }).tool_use_id)
+        }
+      }
+    }
+  }
 
   // System message first
   const sysText = convertSystemPrompt(system)
@@ -357,7 +410,10 @@ function convertMessages(
     result.push({ role: 'system', content: sysText })
   }
 
-  for (const msg of messages) {
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]
+    const isLastInHistory = i === messages.length - 1
+
     // Claude Code wraps messages in { role, message: { role, content } }
     const inner = msg.message ?? msg
     const role = (inner as { role?: string }).role ?? msg.role
@@ -366,8 +422,12 @@ function convertMessages(
     if (role === 'user') {
       // Check for tool_result blocks in user messages
       if (Array.isArray(content)) {
-        const toolResults = content.filter((b: { type?: string }) => b.type === 'tool_result')
-        const otherContent = content.filter((b: { type?: string }) => b.type !== 'tool_result')
+        const toolResults = content.filter(
+          (b: { type?: string }) => b.type === 'tool_result',
+        )
+        const otherContent = content.filter(
+          (b: { type?: string }) => b.type !== 'tool_result',
+        )
 
         // Emit tool results as tool messages, but ONLY if we have a matching tool_use ID.
         // Mistral/OpenAI strictly require tool messages to follow an assistant message with tool_calls.
@@ -382,7 +442,9 @@ function convertMessages(
               content: convertToolResultContent(tr.content, tr.is_error),
             })
           } else {
-            logForDebugging(`Dropping orphan tool_result for ID: ${id} to prevent API error`)
+            logForDebugging(
+              `Dropping orphan tool_result for ID: ${id} to prevent API error`,
+            )
           }
         }
 
@@ -402,8 +464,12 @@ function convertMessages(
     } else if (role === 'assistant') {
       // Check for tool_use blocks
       if (Array.isArray(content)) {
-        const toolUses = content.filter((b: { type?: string }) => b.type === 'tool_use')
-        const thinkingBlock = content.find((b: { type?: string }) => b.type === 'thinking')
+        const toolUses = content.filter(
+          (b: { type?: string }) => b.type === 'tool_use',
+        )
+        const thinkingBlock = content.find(
+          (b: { type?: string }) => b.type === 'thinking',
+        )
         const textContent = content.filter(
           (b: { type?: string }) => b.type !== 'tool_use' && b.type !== 'thinking',
         )
@@ -412,70 +478,108 @@ function convertMessages(
           role: 'assistant',
           content: (() => {
             const c = convertContentBlocks(textContent)
-            return typeof c === 'string' ? c : Array.isArray(c) ? c.map((p: { text?: string }) => p.text ?? '').join('') : ''
+            return typeof c === 'string'
+              ? c
+              : Array.isArray(c)
+                ? c.map((p: { text?: string }) => p.text ?? '').join('')
+                : ''
           })(),
         }
 
         if (toolUses.length > 0) {
-          assistantMsg.tool_calls = toolUses.map(
-            (tu: {
-              id?: string
-              name?: string
-              input?: unknown
-              extra_content?: Record<string, unknown>
-              signature?: string
-            }) => {
-              const id = tu.id ?? `call_${crypto.randomUUID().replace(/-/g, '')}`
-              knownToolCallIds.add(id)
-              const toolCall: NonNullable<OpenAIMessage['tool_calls']>[number] = {
-                id,
-                type: 'function' as const,
-                function: {
-                  name: tu.name ?? 'unknown',
-                  arguments:
-                    typeof tu.input === 'string'
-                      ? tu.input
-                      : JSON.stringify(tu.input ?? {}),
-                },
-              }
+          const mappedToolCalls = toolUses
+            .map(
+              (tu: {
+                id?: string
+                name?: string
+                input?: unknown
+                extra_content?: Record<string, unknown>
+                signature?: string
+              }) => {
+                const id = tu.id ?? `call_${crypto.randomUUID().replace(/-/g, '')}`
 
-              // Preserve existing extra_content if present
-              if (tu.extra_content) {
-                toolCall.extra_content = { ...tu.extra_content }
-              }
+                // Only keep tool calls that have a corresponding result in the history,
+                // or if it's the last message (prefill scenario).
+                // Orphaned tool calls (e.g. from user interruption) cause 400 errors.
+                if (!toolResultIds.has(id) && !isLastInHistory) {
+                  return null
+                }
 
-              // Handle Gemini thought_signature
-              if (isGeminiMode()) {
-                // If the model provided a signature in the tool_use block itself (e.g. from a previous Turn/Step)
-                // Use thinkingBlock.signature for ALL tool calls in the same assistant turn if available.
-                // The API requires the same signature on every replayed function call part in a parallel set.
-                const signature = tu.signature ?? (thinkingBlock as any)?.signature
+                knownToolCallIds.add(id)
+                const toolCall: NonNullable<
+                  OpenAIMessage['tool_calls']
+                >[number] = {
+                  id,
+                  type: 'function' as const,
+                  function: {
+                    name: tu.name ?? 'unknown',
+                    arguments:
+                      typeof tu.input === 'string'
+                        ? tu.input
+                        : JSON.stringify(tu.input ?? {}),
+                  },
+                }
 
-                // Merge into existing google-specific metadata if present
-                const existingGoogle = (toolCall.extra_content?.google as Record<string, unknown>) ?? {}
-                toolCall.extra_content = {
-                  ...toolCall.extra_content,
-                  google: {
-                    ...existingGoogle,
-                    thought_signature: signature ?? "skip_thought_signature_validator"
+                // Preserve existing extra_content if present
+                if (tu.extra_content) {
+                  toolCall.extra_content = { ...tu.extra_content }
+                }
+
+                // Handle Gemini thought_signature
+                if (isGeminiMode()) {
+                  // If the model provided a signature in the tool_use block itself (e.g. from a previous Turn/Step)
+                  // Use thinkingBlock.signature for ALL tool calls in the same assistant turn if available.
+                  // The API requires the same signature on every replayed function call part in a parallel set.
+                  const signature =
+                    tu.signature ?? (thinkingBlock as any)?.signature
+
+                  // Merge into existing google-specific metadata if present
+                  const existingGoogle =
+                    (toolCall.extra_content?.google as Record<
+                      string,
+                      unknown
+                    >) ?? {}
+                  toolCall.extra_content = {
+                    ...toolCall.extra_content,
+                    google: {
+                      ...existingGoogle,
+                      thought_signature:
+                        signature ?? 'skip_thought_signature_validator',
+                    },
                   }
                 }
-              }
 
-              return toolCall
-            },
-          )
+                return toolCall
+              },
+            )
+            .filter((tc): tc is NonNullable<typeof tc> => tc !== null)
+
+          if (mappedToolCalls.length > 0) {
+            assistantMsg.tool_calls = mappedToolCalls
+          }
         }
 
-        result.push(assistantMsg)
+        // Only push assistant message if it has content or tool calls.
+        // Stripped thinking-only blocks from user interruptions are empty and cause 400s.
+        if (assistantMsg.content || assistantMsg.tool_calls?.length) {
+          result.push(assistantMsg)
+        }
       } else {
-        result.push({
+        const assistantMsg: OpenAIMessage = {
           role: 'assistant',
           content: (() => {
             const c = convertContentBlocks(content)
-            return typeof c === 'string' ? c : Array.isArray(c) ? c.map((p: { text?: string }) => p.text ?? '').join('') : ''
+            return typeof c === 'string'
+              ? c
+              : Array.isArray(c)
+                ? c.map((p: { text?: string }) => p.text ?? '').join('')
+                : ''
           })(),
-        })
+        }
+
+        if (assistantMsg.content) {
+          result.push(assistantMsg)
+        }
       }
     }
   }
@@ -489,25 +593,56 @@ function convertMessages(
   for (const msg of result) {
     const prev = coalesced[coalesced.length - 1]
 
-    if (prev && prev.role === msg.role && msg.role !== 'tool' && msg.role !== 'system') {
-      const prevContent = prev.content
+    // Mistral/Devstral: 'tool' message must be followed by an 'assistant' message.
+    // If a 'tool' result is followed by a 'user' message, we must inject a semantic
+    // assistant response to satisfy the strict role sequence:
+    // ... -> assistant (calls) -> tool (results) -> assistant (semantic) -> user (next)
+    if (prev && prev.role === 'tool' && msg.role === 'user') {
+      coalesced.push({
+        role: 'assistant',
+        content: '[Tool execution interrupted by user]',
+      })
+    }
+
+    const lastAfterPossibleInjection = coalesced[coalesced.length - 1]
+    if (
+      lastAfterPossibleInjection &&
+      lastAfterPossibleInjection.role === msg.role &&
+      msg.role !== 'tool' &&
+      msg.role !== 'system'
+    ) {
+      const prevContent = lastAfterPossibleInjection.content
       const curContent = msg.content
 
       if (typeof prevContent === 'string' && typeof curContent === 'string') {
-        prev.content = prevContent + (prevContent && curContent ? '\n' : '') + curContent
+        lastAfterPossibleInjection.content =
+          prevContent + (prevContent && curContent ? '\n' : '') + curContent
       } else {
         const toArray = (
-          c: string | Array<{ type: string; text?: string; image_url?: { url: string } }> | undefined,
-        ): Array<{ type: string; text?: string; image_url?: { url: string } }> => {
+          c:
+            | string
+            | Array<{ type: string; text?: string; image_url?: { url: string } }>
+            | undefined,
+        ): Array<{
+          type: string
+          text?: string
+          image_url?: { url: string }
+        }> => {
           if (!c) return []
           if (typeof c === 'string') return c ? [{ type: 'text', text: c }] : []
           return c
         }
-        prev.content = [...toArray(prevContent), ...toArray(curContent)]
+        lastAfterPossibleInjection.content = [
+          ...toArray(prevContent),
+          ...toArray(curContent),
+        ]
       }
 
       if (msg.tool_calls?.length) {
-        prev.tool_calls = [...(prev.tool_calls ?? []), ...msg.tool_calls]
+        lastAfterPossibleInjection.tool_calls = [
+          ...(lastAfterPossibleInjection.tool_calls ?? []),
+          ...msg.tool_calls,
+        ]
       }
     } else {
       coalesced.push(msg)
@@ -607,7 +742,10 @@ function convertTools(
         function: {
           name: t.name,
           description: t.description ?? '',
-          parameters: normalizeSchemaForOpenAI(schema, !isGemini),
+          parameters: normalizeSchemaForOpenAI(
+            schema,
+            !isGemini && !isEnvTruthy(process.env.OPENCLAUDE_DISABLE_STRICT_TOOLS),
+          ),
         },
       }
     })
@@ -715,8 +853,7 @@ async function* openaiStreamToAnthropic(
   let hasEmittedContentStart = false
   let hasEmittedThinkingStart = false
   let hasClosedThinking = false
-  let activeTextBuffer = ''
-  let textBufferMode: 'none' | 'pending' | 'strip' = 'none'
+  const thinkFilter = createThinkTagFilter()
   let lastStopReason: 'tool_use' | 'max_tokens' | 'end_turn' | null = null
   let hasEmittedFinalUsage = false
   let hasProcessedFinishReason = false
@@ -795,14 +932,12 @@ async function* openaiStreamToAnthropic(
   const closeActiveContentBlock = async function* () {
     if (!hasEmittedContentStart) return
 
-    if (textBufferMode !== 'none') {
-      const sanitized = stripLeakedReasoningPreamble(activeTextBuffer)
-      if (sanitized) {
-        yield {
-          type: 'content_block_delta',
-          index: contentBlockIndex,
-          delta: { type: 'text_delta', text: sanitized },
-        }
+    const tail = thinkFilter.flush()
+    if (tail) {
+      yield {
+        type: 'content_block_delta',
+        index: contentBlockIndex,
+        delta: { type: 'text_delta', text: tail },
       }
     }
 
@@ -812,8 +947,6 @@ async function* openaiStreamToAnthropic(
     }
     contentBlockIndex++
     hasEmittedContentStart = false
-    activeTextBuffer = ''
-    textBufferMode = 'none'
   }
 
   try {
@@ -870,7 +1003,6 @@ async function* openaiStreamToAnthropic(
             contentBlockIndex++
             hasClosedThinking = true
           }
-          activeTextBuffer += delta.content
           if (!hasEmittedContentStart) {
             yield {
               type: 'content_block_start',
@@ -880,38 +1012,13 @@ async function* openaiStreamToAnthropic(
             hasEmittedContentStart = true
           }
 
-          if (
-            textBufferMode === 'strip' ||
-            looksLikeLeakedReasoningPrefix(activeTextBuffer)
-          ) {
-            textBufferMode = 'strip'
-            continue
-          }
-
-          if (textBufferMode === 'pending') {
-            if (shouldBufferPotentialReasoningPrefix(activeTextBuffer)) {
-              continue
-            }
+          const visible = thinkFilter.feed(delta.content)
+          if (visible) {
             yield {
               type: 'content_block_delta',
               index: contentBlockIndex,
-              delta: {
-                type: 'text_delta',
-                text: activeTextBuffer,
-              },
+              delta: { type: 'text_delta', text: visible },
             }
-            textBufferMode = 'none'
-            continue
-          }
-
-          if (shouldBufferPotentialReasoningPrefix(activeTextBuffer)) {
-            textBufferMode = 'pending'
-            continue
-          }
-          yield {
-            type: 'content_block_delta',
-            index: contentBlockIndex,
-            delta: { type: 'text_delta', text: delta.content },
           }
         }
 
@@ -1326,14 +1433,15 @@ class OpenAIShimMessages {
     params: ShimCreateParams,
     options?: { signal?: AbortSignal; headers?: Record<string, string> },
   ): Promise<Response> {
-    const openaiMessages = convertMessages(
+    const compressedMessages = compressToolHistory(
       params.messages as Array<{
         role: string
         message?: { role?: string; content?: unknown }
         content?: unknown
       }>,
-      params.system,
+      request.resolvedModel,
     )
+    const openaiMessages = convertMessages(compressedMessages, params.system)
 
     const body: Record<string, unknown> = {
       model: request.resolvedModel,
@@ -1369,14 +1477,19 @@ class OpenAIShimMessages {
     const isGithubCopilot = isGithub && githubEndpointType === 'copilot'
     const isGithubModels = isGithub && (githubEndpointType === 'models' || githubEndpointType === 'custom')
 
-    if ((isGithub || isMistral || isLocal) && body.max_completion_tokens !== undefined) {
+    const isMoonshot = isMoonshotBaseUrl(request.baseUrl)
+
+    if ((isGithub || isMistral || isLocal || isMoonshot) && body.max_completion_tokens !== undefined) {
       body.max_tokens = body.max_completion_tokens
       delete body.max_completion_tokens
     }
 
     // mistral and gemini don't recognize body.store — Gemini returns 400
     // "Invalid JSON payload received. Unknown name 'store': Cannot find field."
-    if (isMistral || isGeminiMode()) {
+    // Moonshot (api.moonshot.ai/.cn) has not published support for the
+    // parameter either; strip it preemptively to avoid the same class of
+    // error on strict-parse providers.
+    if (isMistral || isGeminiMode() || isMoonshot) {
       delete body.store
     }
 
@@ -1456,48 +1569,95 @@ class OpenAIShimMessages {
       headers['X-GitHub-Api-Version'] = '2022-11-28'
     }
 
-    // Build the chat completions URL
-    // Azure Cognitive Services / Azure OpenAI require a deployment-specific path
-    // and an api-version query parameter.
-    // Standard format: {base}/openai/deployments/{model}/chat/completions?api-version={version}
-    // Non-Azure: {base}/chat/completions
-    let chatCompletionsUrl: string
-    if (isAzure) {
-      const apiVersion = process.env.AZURE_OPENAI_API_VERSION ?? '2024-12-01-preview'
-      const deployment = request.resolvedModel ?? process.env.OPENAI_MODEL ?? 'gpt-4o'
-      // If base URL already contains /deployments/, use it as-is with api-version
-      if (/\/deployments\//i.test(request.baseUrl)) {
-        const base = request.baseUrl.replace(/\/+$/, '')
-        chatCompletionsUrl = `${base}/chat/completions?api-version=${apiVersion}`
-      } else {
-        // Strip trailing /v1 or /openai/v1 if present, then build Azure path
-        const base = request.baseUrl.replace(/\/(openai\/)?v1\/?$/, '').replace(/\/+$/, '')
-        chatCompletionsUrl = `${base}/openai/deployments/${deployment}/chat/completions?api-version=${apiVersion}`
+    const buildChatCompletionsUrl = (baseUrl: string): string => {
+      // Azure Cognitive Services / Azure OpenAI require a deployment-specific
+      // path and an api-version query parameter.
+      if (isAzure) {
+        const apiVersion = process.env.AZURE_OPENAI_API_VERSION ?? '2024-12-01-preview'
+        const deployment = request.resolvedModel ?? process.env.OPENAI_MODEL ?? 'gpt-4o'
+
+        // If base URL already contains /deployments/, use it as-is with api-version.
+        if (/\/deployments\//i.test(baseUrl)) {
+          const normalizedBase = baseUrl.replace(/\/+$/, '')
+          return `${normalizedBase}/chat/completions?api-version=${apiVersion}`
+        }
+
+        // Strip trailing /v1 or /openai/v1 if present, then build Azure path.
+        const normalizedBase = baseUrl
+          .replace(/\/(openai\/)?v1\/?$/, '')
+          .replace(/\/+$/, '')
+
+        return `${normalizedBase}/openai/deployments/${deployment}/chat/completions?api-version=${apiVersion}`
       }
-    } else {
-      chatCompletionsUrl = `${request.baseUrl}/chat/completions`
+
+      return `${baseUrl}/chat/completions`
     }
 
-    const fetchInit = {
+    const localRetryBaseUrls = isLocal
+      ? getLocalProviderRetryBaseUrls(request.baseUrl)
+      : []
+
+    let activeBaseUrl = request.baseUrl
+    let chatCompletionsUrl = buildChatCompletionsUrl(activeBaseUrl)
+    const attemptedLocalBaseUrls = new Set<string>([activeBaseUrl])
+    let didRetryWithoutTools = false
+
+    const promoteNextLocalBaseUrl = (
+      reason: 'endpoint_not_found' | 'localhost_resolution_failed',
+    ): boolean => {
+      for (const candidateBaseUrl of localRetryBaseUrls) {
+        if (attemptedLocalBaseUrls.has(candidateBaseUrl)) {
+          continue
+        }
+
+        const previousUrl = chatCompletionsUrl
+        attemptedLocalBaseUrls.add(candidateBaseUrl)
+        activeBaseUrl = candidateBaseUrl
+        chatCompletionsUrl = buildChatCompletionsUrl(activeBaseUrl)
+
+        logForDebugging(
+          `[OpenAIShim] self-heal retry reason=${reason} method=POST from=${redactUrlForDiagnostics(previousUrl)} to=${redactUrlForDiagnostics(chatCompletionsUrl)} model=${request.resolvedModel}`,
+          { level: 'warn' },
+        )
+
+        return true
+      }
+
+      return false
+    }
+
+    let serializedBody = JSON.stringify(body)
+
+    const refreshSerializedBody = (): void => {
+      serializedBody = JSON.stringify(body)
+    }
+
+    const buildFetchInit = () => ({
       method: 'POST' as const,
       headers,
-      body: JSON.stringify(body),
+      body: serializedBody,
       signal: options?.signal,
-    }
+    })
 
-    const maxAttempts = isGithub ? GITHUB_429_MAX_RETRIES : 1
+    const maxSelfHealAttempts = isLocal
+      ? localRetryBaseUrls.length + 1
+      : 0
+    const maxAttempts = (isGithub ? GITHUB_429_MAX_RETRIES : 1) + maxSelfHealAttempts
 
     const throwClassifiedTransportError = (
       error: unknown,
       requestUrl: string,
+      preclassifiedFailure?: ReturnType<typeof classifyOpenAINetworkFailure>,
     ): never => {
       if (options?.signal?.aborted) {
         throw error
       }
 
-      const failure = classifyOpenAINetworkFailure(error, {
-        url: requestUrl,
-      })
+      const failure =
+        preclassifiedFailure ??
+        classifyOpenAINetworkFailure(error, {
+          url: requestUrl,
+        })
       const redactedUrl = redactUrlForDiagnostics(requestUrl)
       const safeMessage =
         redactSecretValueForDisplay(
@@ -1528,11 +1688,14 @@ class OpenAIShimMessages {
       responseHeaders: Headers,
       requestUrl: string,
       rateHint = '',
+      preclassifiedFailure?: ReturnType<typeof classifyOpenAIHttpFailure>,
     ): never => {
-      const failure = classifyOpenAIHttpFailure({
-        status,
-        body: errorBody,
-      })
+      const failure =
+        preclassifiedFailure ??
+        classifyOpenAIHttpFailure({
+          status,
+          body: errorBody,
+        })
       const redactedUrl = redactUrlForDiagnostics(requestUrl)
 
       logForDebugging(
@@ -1554,10 +1717,13 @@ class OpenAIShimMessages {
     let response: Response | undefined
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
-        response = await fetchWithProxyRetry(chatCompletionsUrl, fetchInit)
+        response = await fetchWithProxyRetry(
+          chatCompletionsUrl,
+          buildFetchInit(),
+        )
       } catch (error) {
         const isAbortError =
-          fetchInit.signal?.aborted === true ||
+          options?.signal?.aborted === true ||
           (typeof DOMException !== 'undefined' &&
             error instanceof DOMException &&
             error.name === 'AbortError') ||
@@ -1570,7 +1736,19 @@ class OpenAIShimMessages {
           throw error
         }
 
-        throwClassifiedTransportError(error, chatCompletionsUrl)
+        const failure = classifyOpenAINetworkFailure(error, {
+          url: chatCompletionsUrl,
+        })
+
+        if (
+          isLocal &&
+          failure.category === 'localhost_resolution_failed' &&
+          promoteNextLocalBaseUrl('localhost_resolution_failed')
+        ) {
+          continue
+        }
+
+        throwClassifiedTransportError(error, chatCompletionsUrl, failure)
       }
 
       if (response.ok) {
@@ -1657,11 +1835,15 @@ class OpenAIShimMessages {
           } catch (error) {
             throwClassifiedTransportError(error, responsesUrl)
           }
-          
+
           if (responsesResponse.ok) {
             return responsesResponse
           }
           const responsesErrorBody = await responsesResponse.text().catch(() => 'unknown error')
+          const responsesFailure = classifyOpenAIHttpFailure({
+            status: responsesResponse.status,
+            body: responsesErrorBody,
+          })
           let responsesErrorResponse: object | undefined
           try { responsesErrorResponse = JSON.parse(responsesErrorBody) } catch { /* raw text */ }
           throwClassifiedHttpError(
@@ -1670,8 +1852,47 @@ class OpenAIShimMessages {
             responsesErrorResponse,
             responsesResponse.headers,
             responsesUrl,
+            '',
+            responsesFailure,
           )
         }
+      }
+
+      const failure = classifyOpenAIHttpFailure({
+        status: response.status,
+        body: errorBody,
+      })
+
+      if (
+        isLocal &&
+        failure.category === 'endpoint_not_found' &&
+        promoteNextLocalBaseUrl('endpoint_not_found')
+      ) {
+        continue
+      }
+
+      const hasToolsPayload =
+        Array.isArray(body.tools) &&
+        body.tools.length > 0
+
+      if (
+        !didRetryWithoutTools &&
+        failure.category === 'tool_call_incompatible' &&
+        shouldAttemptLocalToollessRetry({
+          baseUrl: activeBaseUrl,
+          hasTools: hasToolsPayload,
+        })
+      ) {
+        didRetryWithoutTools = true
+        delete body.tools
+        delete body.tool_choice
+        refreshSerializedBody()
+
+        logForDebugging(
+          `[OpenAIShim] self-heal retry reason=tool_call_incompatible mode=toolless method=POST url=${redactUrlForDiagnostics(chatCompletionsUrl)} model=${request.resolvedModel}`,
+          { level: 'warn' },
+        )
+        continue
       }
 
       let errorResponse: object | undefined
@@ -1683,6 +1904,7 @@ class OpenAIShimMessages {
         response.headers as unknown as Headers,
         chatCompletionsUrl,
         rateHint,
+        failure,
       )
     }
 
@@ -1739,7 +1961,7 @@ class OpenAIShimMessages {
     if (typeof rawContent === 'string' && rawContent) {
       content.push({
         type: 'text',
-        text: stripLeakedReasoningPreamble(rawContent),
+        text: stripThinkTags(rawContent),
       })
     } else if (Array.isArray(rawContent) && rawContent.length > 0) {
       const parts: string[] = []
@@ -1757,7 +1979,7 @@ class OpenAIShimMessages {
       if (joined) {
         content.push({
           type: 'text',
-          text: stripLeakedReasoningPreamble(joined),
+          text: stripThinkTags(joined),
         })
       }
     }
