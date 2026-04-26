@@ -37,13 +37,16 @@ import {
   readGithubModelsTokenAsync,
 } from '../utils/githubModelsCredentials.js'
 import {
+  probeAtomicChatReadiness,
   probeOllamaGenerationReadiness,
+  type AtomicChatReadiness,
   type OllamaGenerationReadiness,
 } from '../utils/providerDiscovery.js'
 import {
   rankOllamaModels,
   recommendOllamaModel,
 } from '../utils/providerRecommendation.js'
+import { clearStartupProviderOverrides } from '../utils/providerStartupOverrides.js'
 import { redactUrlForDisplay } from '../utils/urlRedaction.js'
 import { updateSettingsForSource } from '../utils/settings/settings.js'
 import {
@@ -69,6 +72,7 @@ type Screen =
   | 'menu'
   | 'select-preset'
   | 'select-ollama-model'
+  | 'select-atomic-chat-model'
   | 'codex-oauth'
   | 'form'
   | 'select-active'
@@ -80,6 +84,16 @@ type DraftField = 'name' | 'baseUrl' | 'model' | 'apiKey'
 type ProviderDraft = Record<DraftField, string>
 
 type OllamaSelectionState =
+  | { state: 'idle' }
+  | { state: 'loading' }
+  | {
+      state: 'ready'
+      options: OptionWithDescription<string>[]
+      defaultValue?: string
+    }
+  | { state: 'unavailable'; message: string }
+
+type AtomicChatSelectionState =
   | { state: 'idle' }
   | { state: 'loading' }
   | {
@@ -111,8 +125,8 @@ const FORM_STEPS: Array<{
   {
     key: 'model',
     label: 'Default model',
-    placeholder: 'e.g. llama3.1:8b or glm-4.7, glm-4.7-flash',
-    helpText: 'Model name(s) to use. Separate multiple with commas; first is default.',
+    placeholder: 'e.g. llama3.1:8b or glm-4.7; glm-4.7-flash',
+    helpText: 'Model name(s) to use. Separate multiple with ";" or ","; first is default.',
   },
   {
     key: 'apiKey',
@@ -220,6 +234,21 @@ function getGithubProviderSummary(
         : 'no token found'
   const activeSuffix = isActive ? ' (active)' : ''
   return `github-models · ${GITHUB_PROVIDER_DEFAULT_BASE_URL} · ${getGithubProviderModel(processEnv)} · ${credentialSummary}${activeSuffix}`
+}
+
+function describeAtomicChatSelectionIssue(
+  readiness: AtomicChatReadiness,
+  baseUrl: string,
+): string {
+  if (readiness.state === 'unreachable') {
+    return `Could not reach Atomic Chat at ${redactUrlForDisplay(baseUrl)}. Start the Atomic Chat app first, or enter the endpoint manually.`
+  }
+
+  if (readiness.state === 'no_models') {
+    return 'Atomic Chat is running, but no models are loaded. Download and load a model inside the Atomic Chat app first, or enter details manually.'
+  }
+
+  return ''
 }
 
 function describeOllamaSelectionIssue(
@@ -395,6 +424,8 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
   const [ollamaSelection, setOllamaSelection] = React.useState<OllamaSelectionState>({
     state: 'idle',
   })
+  const [atomicChatSelection, setAtomicChatSelection] =
+    React.useState<AtomicChatSelectionState>({ state: 'idle' })
   // Deferred initialization: useState initializers run synchronously during
   // render, so getProviderProfiles() and getActiveProviderProfile() would block
   // the UI (sync file I/O). Defer to queueMicrotask after first render.
@@ -583,6 +614,45 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     }
   }, [draft.baseUrl, screen])
 
+  React.useEffect(() => {
+    if (screen !== 'select-atomic-chat-model') {
+      return
+    }
+
+    let cancelled = false
+    setAtomicChatSelection({ state: 'loading' })
+
+    void (async () => {
+      const readiness = await probeAtomicChatReadiness({
+        baseUrl: draft.baseUrl,
+      })
+      if (readiness.state !== 'ready') {
+        if (!cancelled) {
+          setAtomicChatSelection({
+            state: 'unavailable',
+            message: describeAtomicChatSelectionIssue(readiness, draft.baseUrl),
+          })
+        }
+        return
+      }
+
+      if (!cancelled) {
+        setAtomicChatSelection({
+          state: 'ready',
+          defaultValue: readiness.models[0],
+          options: readiness.models.map(model => ({
+            label: model,
+            value: model,
+          })),
+        })
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [draft.baseUrl, screen])
+
   function refreshProfiles(): void {
     // Defer sync I/O to next microtask to prevent UI freeze.
     // getProviderProfiles() and getActiveProviderProfile() read config files
@@ -602,17 +672,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
   }
 
   function clearStartupProviderOverrideFromUserSettings(): string | null {
-    const { error } = updateSettingsForSource('userSettings', {
-      env: {
-        CLAUDE_CODE_USE_OPENAI: undefined as any,
-        CLAUDE_CODE_USE_GEMINI: undefined as any,
-        CLAUDE_CODE_USE_GITHUB: undefined as any,
-        CLAUDE_CODE_USE_BEDROCK: undefined as any,
-        CLAUDE_CODE_USE_VERTEX: undefined as any,
-        CLAUDE_CODE_USE_FOUNDRY: undefined as any,
-      },
-    })
-    return error ? error.message : null
+    return clearStartupProviderOverrides()
   }
 
   function buildCodexOAuthActivationMessage(options: {
@@ -720,19 +780,14 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
       // Update the session model to the new provider's first model.
       // persistActiveProviderProfileModel (called by onChangeAppState) will
       // not overwrite the multi-model list because it checks if the model
-      // is already in the profile's comma-separated model list.
+      // is already in the provider's configured model list.
       const newModel = getPrimaryModel(active.model)
       setAppState(prev => ({
         ...prev,
         mainLoopModel: newModel,
-      }))
-
-      providerLabel = active.name
-      setAppState(prev => ({
-        ...prev,
-        mainLoopModel: active.model,
         mainLoopModelForSession: null,
       }))
+      providerLabel = active.name
       const settingsOverrideError =
         clearStartupProviderOverrideFromUserSettings()
       const isActiveCodexOAuth = isCodexOAuthProfile(
@@ -889,6 +944,12 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
       return
     }
 
+    if (preset === 'atomic-chat') {
+      setAtomicChatSelection({ state: 'loading' })
+      setScreen('select-atomic-chat-model')
+      return
+    }
+
     setScreen('form')
   }
 
@@ -930,7 +991,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     if (isActiveSavedProfile) {
       setAppState(prev => ({
         ...prev,
-        mainLoopModel: saved.model,
+        mainLoopModel: getPrimaryModel(saved.model),
         mainLoopModelForSession: null,
       }))
     }
@@ -962,6 +1023,86 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     setFormStepIndex(0)
     setErrorMessage(undefined)
     returnToMenu()
+  }
+
+  function renderAtomicChatSelection(): React.ReactNode {
+    if (
+      atomicChatSelection.state === 'loading' ||
+      atomicChatSelection.state === 'idle'
+    ) {
+      return (
+        <Box flexDirection="column" gap={1}>
+          <Text color="remember" bold>
+            Checking Atomic Chat
+          </Text>
+          <Text dimColor>Looking for loaded Atomic Chat models...</Text>
+        </Box>
+      )
+    }
+
+    if (atomicChatSelection.state === 'unavailable') {
+      return (
+        <Box flexDirection="column" gap={1}>
+          <Text color="remember" bold>
+            Atomic Chat setup
+          </Text>
+          <Text dimColor>{atomicChatSelection.message}</Text>
+          <Select
+            options={[
+              {
+                value: 'manual',
+                label: 'Enter manually',
+                description: 'Fill in the base URL and model yourself',
+              },
+              {
+                value: 'back',
+                label: 'Back',
+                description: 'Choose another provider preset',
+              },
+            ]}
+            onChange={(value: string) => {
+              if (value === 'manual') {
+                setFormStepIndex(0)
+                setCursorOffset(draft.name.length)
+                setScreen('form')
+                return
+              }
+              setScreen('select-preset')
+            }}
+            onCancel={() => setScreen('select-preset')}
+            visibleOptionCount={2}
+          />
+        </Box>
+      )
+    }
+
+    return (
+      <Box flexDirection="column" gap={1}>
+        <Text color="remember" bold>
+          Choose an Atomic Chat model
+        </Text>
+        <Text dimColor>
+          Pick one of the models loaded in Atomic Chat to save into a local
+          provider profile.
+        </Text>
+        <Select
+          options={atomicChatSelection.options}
+          defaultValue={atomicChatSelection.defaultValue}
+          defaultFocusValue={atomicChatSelection.defaultValue}
+          inlineDescriptions
+          visibleOptionCount={Math.min(8, atomicChatSelection.options.length)}
+          onChange={(value: string) => {
+            const nextDraft = {
+              ...draft,
+              model: value,
+            }
+            setDraft(nextDraft)
+            persistDraft(nextDraft)
+          }}
+          onCancel={() => setScreen('select-preset')}
+        />
+      </Box>
+    )
   }
 
   function renderOllamaSelection(): React.ReactNode {
@@ -1115,9 +1256,19 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
         description: 'Native Claude API (x-api-key auth)',
       },
       {
+        value: 'atomic-chat',
+        label: 'Atomic Chat',
+        description: 'Local Model Provider',
+      },
+      {
         value: 'azure-openai',
         label: 'Azure OpenAI',
         description: 'Azure OpenAI endpoint (model=deployment name)',
+      },
+      {
+        value: 'bankr',
+        label: 'Bankr',
+        description: 'Bankr LLM Gateway (OpenAI-compatible)',
       },
       ...(canUseCodexOAuth
         ? [
@@ -1161,8 +1312,13 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
       },
       {
         value: 'moonshotai',
-        label: 'Moonshot AI',
-        description: 'Kimi OpenAI-compatible endpoint',
+        label: 'Moonshot AI - API',
+        description: 'Moonshot AI - API endpoint',
+      },
+      {
+        value: 'kimi-code',
+        label: 'Moonshot AI - Kimi Code',
+        description: 'Moonshot AI - Kimi Code Subscription endpoint',
       },
       {
         value: 'nvidia-nim',
@@ -1188,6 +1344,11 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
         value: 'together',
         label: 'Together AI',
         description: 'Together chat/completions endpoint',
+      },
+      {
+        value: 'zai',
+        label: 'Z.AI - GLM Coding Plan',
+        description: 'Z.AI GLM coding subscription endpoint',
       },
       {
         value: 'custom',
@@ -1472,6 +1633,9 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
       break
     case 'select-ollama-model':
       content = renderOllamaSelection()
+      break
+    case 'select-atomic-chat-model':
+      content = renderAtomicChatSelection()
       break
     case 'codex-oauth':
       content = (

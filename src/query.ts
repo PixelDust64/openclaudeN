@@ -252,6 +252,15 @@ async function* queryLoop(
   | ToolUseSummaryMessage,
   Terminal
 > {
+  // Start a new turn for multi-turn context tracking
+  if (
+    feature('MULTI_TURN_CONTEXT') &&
+    getGlobalConfig().knowledgeGraphEnabled
+  ) {
+    const { startNewTurn } = await import('./utils/multiTurnContext.js')
+    startNewTurn()
+  }
+
   // Immutable params — never reassigned during the query loop.
   const {
     systemPrompt,
@@ -368,6 +377,16 @@ async function* queryLoop(
 
     let messagesForQuery = [...getMessagesAfterCompactBoundary(messages)]
 
+    // Extract facts and update phase from the latest message (user input or tool result)
+    if (
+      feature('CONVERSATION_ARC') &&
+      getGlobalConfig().knowledgeGraphEnabled &&
+      messagesForQuery.length > 0
+    ) {
+      const { updateArcPhase } = await import('./utils/conversationArc.js')
+      updateArcPhase([messagesForQuery[messagesForQuery.length - 1]])
+    }
+
     let tracking = autoCompactTracking
 
     // Enforce per-message budget on aggregate tool result size. Runs BEFORE
@@ -456,8 +475,14 @@ async function* queryLoop(
       messagesForQuery = collapseResult.messages
     }
 
+    const lastMessage = messagesForQuery[messagesForQuery.length - 1]
+    const userQueryText = lastMessage?.type === 'user' ? (typeof lastMessage.message.content === 'string' ? lastMessage.message.content : '') : ''
+
+    const { getArcSummary } = await import('./utils/conversationArc.js')
+    const arcSummary = getArcSummary(userQueryText)
+
     const fullSystemPrompt = asSystemPrompt(
-      appendSystemContext(systemPrompt, systemContext),
+      appendSystemContext(`${systemPrompt}\n\n${arcSummary}`, systemContext),
     )
 
     queryCheckpoint('query_autocompact_start')
@@ -1516,6 +1541,34 @@ async function* queryLoop(
     }
     queryCheckpoint('query_tool_execution_end')
 
+    // Track multi-turn context after tool execution
+    if (
+      feature('MULTI_TURN_CONTEXT') &&
+      getGlobalConfig().knowledgeGraphEnabled
+    ) {
+      const { addMessageToTurn, addToolCallToTurn } = await import(
+        './utils/multiTurnContext.js'
+      )
+      addMessageToTurn(assistantMessage)
+      for (const toolUse of toolUseBlocks) {
+        addToolCallToTurn({
+          id: toolUse.id,
+          name: toolUse.name,
+          input: toolUse.input as Record<string, unknown>,
+          timestamp: Date.now(),
+        })
+      }
+    }
+
+    // Update conversation arc phase
+    if (
+      feature('CONVERSATION_ARC') &&
+      getGlobalConfig().knowledgeGraphEnabled
+    ) {
+      const { updateArcPhase } = await import('./utils/conversationArc.js')
+      updateArcPhase([assistantMessage])
+    }
+
     // Generate tool use summary after tool batch completes — passed to next recursive call
     let nextPendingToolUseSummary:
       | Promise<ToolUseSummaryMessage | null>
@@ -1820,6 +1873,13 @@ async function* queryLoop(
     }
 
     queryCheckpoint('query_recursive_call')
+    
+    // Persist conversation progress to global project memory
+    if (getGlobalConfig().knowledgeGraphEnabled) {
+      const { finalizeArcTurn } = await import('./utils/conversationArc.js')
+      finalizeArcTurn()
+    }
+
     const next: State = {
       messages: [...messagesForQuery, ...assistantMessages, ...toolResults],
       toolUseContext: toolUseContextWithQueryTracking,
