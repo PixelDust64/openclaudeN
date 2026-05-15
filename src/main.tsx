@@ -35,6 +35,7 @@ import type { Root } from './ink.js';
 import { launchRepl } from './replLauncher.js';
 import { hasGrowthBookEnvOverride, initializeGrowthBook, refreshGrowthBookAfterAuthChange } from './services/analytics/growthbook.js';
 import { fetchBootstrapData } from './services/api/bootstrap.js';
+import { refreshStartupDiscoveryForActiveRoute } from './integrations/discoveryService.js';
 import { prefetchOllamaModels } from './utils/model/ollamaModels.js';
 import { type DownloadResult, downloadSessionFiles, type FilesApiConfig, parseFileSpecs } from './services/api/filesApi.js';
 import { prefetchPassesEligibility } from './services/api/referral.js';
@@ -107,6 +108,7 @@ import { setupClaudeInChrome, shouldAutoEnableClaudeInChrome, shouldEnableClaude
 import { getContextWindowForModel } from './utils/context.js';
 import { loadConversationForResume } from './utils/conversationRecovery.js';
 import { buildDeepLinkBanner } from './utils/deepLink/banner.js';
+import { createCombinedAbortSignal } from './utils/combinedAbortSignal.js';
 import { hasNodeOption, isBareMode, isEnvTruthy, isInProtectedNamespace } from './utils/envUtils.js';
 import { refreshExampleCommands } from './utils/exampleCommands.js';
 import type { FpsMetrics } from './utils/fpsTracker.js';
@@ -158,6 +160,7 @@ import { getCwd } from 'src/utils/cwd.js';
 import { logForDebugging, setHasFormattedOutput } from 'src/utils/debug.js';
 import { errorMessage, getErrnoCode, isENOENT, TeleportOperationError, toError } from 'src/utils/errors.js';
 import { getFsImplementation, safeResolvePath } from 'src/utils/fsOperations.js';
+import { isInteractiveSession } from 'src/utils/interactivity.js';
 import { gracefulShutdown, gracefulShutdownSync } from 'src/utils/gracefulShutdown.js';
 import { setAllHookEventsEnabled } from 'src/utils/hooks/hookEvents.js';
 import { refreshModelCapabilities } from 'src/utils/model/modelCapabilities.js';
@@ -412,7 +415,11 @@ export function startDeferredPrefetches(): void {
   if (isEnvTruthy(process.env.CLAUDE_CODE_USE_VERTEX) && !isEnvTruthy(process.env.CLAUDE_CODE_SKIP_VERTEX_AUTH)) {
     void prefetchGcpCredentialsIfSafe();
   }
-  void countFilesRoundedRg(getCwd(), AbortSignal.timeout(3000), []);
+  const { signal: countFilesSignal, cleanup: cleanupCountFilesSignal } =
+    createCombinedAbortSignal(undefined, { timeoutMs: 3000 });
+  void countFilesRoundedRg(getCwd(), countFilesSignal, []).finally(
+    cleanupCountFilesSignal,
+  );
 
   // Analytics and feature flag initialization
   void initializeAnalyticsGates();
@@ -583,6 +590,7 @@ const _pendingSSH: PendingSSH | undefined = feature('SSH_REMOTE') ? {
   local: false,
   extraCliArgs: []
 } : undefined;
+
 export async function main() {
   profileCheckpoint('main_function_start');
 
@@ -795,13 +803,14 @@ export async function main() {
     }
   }
 
-  // Check for -p/--print and --init-only flags early to set isInteractiveSession before init()
+  // Check for interactivity early to set isInteractiveSession before init()
   // This is needed because telemetry initialization calls auth functions that need this flag
-  const cliArgs = process.argv.slice(2);
-  const hasPrintFlag = cliArgs.includes('-p') || cliArgs.includes('--print');
-  const hasInitOnlyFlag = cliArgs.includes('--init-only');
-  const hasSdkUrl = cliArgs.some(arg => arg.startsWith('--sdk-url'));
-  const isNonInteractive = hasPrintFlag || hasInitOnlyFlag || hasSdkUrl || !process.stdout.isTTY;
+  const isInteractive = isInteractiveSession({
+    stdoutIsTTY: process.stdout.isTTY,
+    args: process.argv.slice(2),
+    env: process.env,
+  });
+  const isNonInteractive = !isInteractive;
 
   // Stop capturing early input for non-interactive modes
   if (isNonInteractive) {
@@ -809,7 +818,6 @@ export async function main() {
   }
 
   // Set simplified tracking fields
-  const isInteractive = !isNonInteractive;
   setIsInteractive(isInteractive);
 
   // Initialize entrypoint based on mode - needs to be set before any event is logged
@@ -2335,6 +2343,7 @@ async function run(): Promise<CommanderCommand> {
     const skipStartupPrefetches = isBareMode() || bgRefreshThrottleMs > 0 && Date.now() - lastPrefetched < bgRefreshThrottleMs;
     // Always prefetch Ollama models (not gated by throttle — local server, fast & cheap)
     prefetchOllamaModels();
+    void refreshStartupDiscoveryForActiveRoute();
 
     if (!skipStartupPrefetches) {
       const lastPrefetchedInfo = lastPrefetched > 0 ? ` last ran ${Math.round((Date.now() - lastPrefetched) / 1000)}s ago` : '';
