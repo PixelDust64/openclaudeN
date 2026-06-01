@@ -1,9 +1,14 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { homedir } from 'os'
 import { join } from 'path'
+import {
+  acquireSharedMutationLock,
+  releaseSharedMutationLock,
+} from '../test/sharedMutationLock.js'
 
 import { isInGlobalClaudeFolder } from '../components/permissions/FilePermissionDialog/permissionOptions.tsx'
 import { optionForPermissionSaveDestination } from '../components/permissions/rules/AddPermissionRules.tsx'
+import { getDefaultPermissionModeOptions } from './permissions/defaultPermissionModeOptions.ts'
 import {
   getClaudeSkillScope,
   isClaudeSettingsPath,
@@ -12,11 +17,19 @@ import { getValidationTip } from './settings/validationTips.ts'
 
 const originalConfigDir = process.env.CLAUDE_CONFIG_DIR
 
+beforeEach(async () => {
+  await acquireSharedMutationLock('openclaudeUiSurfaces.test.ts')
+})
+
 afterEach(() => {
-  if (originalConfigDir === undefined) {
-    delete process.env.CLAUDE_CONFIG_DIR
-  } else {
-    process.env.CLAUDE_CONFIG_DIR = originalConfigDir
+  try {
+    if (originalConfigDir === undefined) {
+      delete process.env.CLAUDE_CONFIG_DIR
+    } else {
+      process.env.CLAUDE_CONFIG_DIR = originalConfigDir
+    }
+  } finally {
+    releaseSharedMutationLock()
   }
 })
 
@@ -123,13 +136,23 @@ describe('OpenClaude validation tips', () => {
         'bypassPermissions',
         'default',
         'dontAsk',
+        'fullAccess',
         'plan',
       ],
     })
 
     expect(tip).toEqual({
       suggestion:
-        'Valid modes: "acceptEdits" (ask before file changes), "plan" (analysis only), "bypassPermissions" (auto-accept all), or "default" (standard behavior)',
+        'Valid modes: "acceptEdits" (ask before file changes), "plan" (analysis only), "bypassPermissions" (auto-accept prompts), "fullAccess" (skip even hard safety-check prompts), or "default" (standard behavior)',
     })
+  })
+})
+
+describe('OpenClaude permission mode surfaces', () => {
+  test('default permission mode picker excludes dangerous persisted modes', () => {
+    const options = getDefaultPermissionModeOptions(true)
+
+    expect(options).not.toContain('bypassPermissions')
+    expect(options).not.toContain('fullAccess')
   })
 })
