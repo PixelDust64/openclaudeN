@@ -303,10 +303,32 @@ export function saveMarketplaceToSettings(
 }
 
 /**
+ * Marketplace names are user-supplied and are used directly as object keys for
+ * membership and lookup (`config[name]`) all over this module. On a normal
+ * object, a name that shadows an `Object.prototype` member — `constructor`,
+ * `__proto__`, `toString`, `hasOwnProperty`, … — resolves up the prototype
+ * chain to an inherited value, so `config[name]` is truthy even when no such
+ * marketplace is registered. That makes "not found" guards pass and then act on
+ * a bogus inherited entry (silently mis-deleting or crashing on
+ * `entry.installLocation`). Returning a null-prototype object makes every
+ * `config[name]` lookup own-property-exact.
+ */
+function toNullProtoConfig(
+  config: KnownMarketplacesConfig,
+): KnownMarketplacesConfig {
+  return Object.assign(
+    Object.create(null) as KnownMarketplacesConfig,
+    config,
+  )
+}
+
+/**
  * Load known marketplaces configuration from disk
  *
  * Reads the configuration file at ~/.claude/plugins/known_marketplaces.json
  * which contains a mapping of marketplace names to their sources and metadata.
+ * The returned config is null-prototype (see {@link toNullProtoConfig}) so that
+ * lookups by user-supplied marketplace name are own-property-exact.
  *
  * Example configuration file content:
  * ```json
@@ -344,10 +366,10 @@ export async function loadKnownMarketplacesConfig(): Promise<KnownMarketplacesCo
       })
       throw new ConfigParseError(errorMsg, configFile, data)
     }
-    return parsed.data
+    return toNullProtoConfig(parsed.data)
   } catch (error) {
     if (isENOENT(error)) {
-      return {}
+      return toNullProtoConfig({})
     }
     // If it's already a ConfigParseError, re-throw it
     if (error instanceof ConfigParseError) {
@@ -377,7 +399,7 @@ export async function loadKnownMarketplacesConfigSafe(): Promise<KnownMarketplac
   } catch {
     // Inner function already logged via logForDebugging. Don't logError here —
     // corrupted user config isn't a Claude Code bug, shouldn't hit the error file.
-    return {}
+    return toNullProtoConfig({})
   }
 }
 
@@ -1809,14 +1831,37 @@ async function loadAndCacheMarketplace(
           // Rename temp cache to final name
           try {
             await fs.rename(temporaryCachePath, finalCachePath)
+            temporaryCachePath = finalCachePath
           } catch (renameError) {
             // Rename may fail for cross-device moves (EXDEV). Fall back to
-            // copy + delete.
-            await fs.cp(temporaryCachePath, finalCachePath, { recursive: true })
-            await fs.rm(temporaryCachePath, { recursive: true, force: true })
+            // copy + delete. Recursive copy can still throw ENOENT on Windows
+            // for dangling symlinks or unreadable nested files in large
+            // clones (ChromeDevTools/chrome-devtools-mcp third_party trees,
+            // issue #2183). The clone already succeeded and marketplace.json
+            // was parsed from temporaryCachePath — keep that directory rather
+            // than failing the add.
+            try {
+              await fs.cp(temporaryCachePath, finalCachePath, {
+                recursive: true,
+              })
+              await fs.rm(temporaryCachePath, { recursive: true, force: true })
+              temporaryCachePath = finalCachePath
+            } catch (copyError) {
+              try {
+                await fs.rm(finalCachePath, { recursive: true, force: true })
+              } catch (cleanupError) {
+                logForDebugging(
+                  `Failed to remove partial marketplace cache at ${finalCachePath}: ${errorMessage(cleanupError)}`,
+                  { level: 'warn' },
+                )
+              }
+              logForDebugging(
+                `Marketplace cache rename and copy failed; keeping ${temporaryCachePath}. rename=${errorMessage(renameError)} copy=${errorMessage(copyError)}`,
+                { level: 'warn' },
+              )
+            }
           }
-          temporaryCachePath = finalCachePath
-          cleanupNeeded = false // Successfully renamed, no cleanup needed
+          cleanupNeeded = false // Clone is the live cache (renamed, copied, or kept)
         } catch (error) {
           const errorMsg = errorMessage(error)
           throw new Error(
@@ -2174,7 +2219,7 @@ export async function getMarketplaceCacheOnly(
 
   try {
     const content = await fs.readFile(configFile, { encoding: 'utf-8' })
-    const config = jsonParse(content) as KnownMarketplacesConfig
+    const config = toNullProtoConfig(jsonParse(content) as KnownMarketplacesConfig)
     const entry = config[name]
 
     if (!entry) {
@@ -2249,16 +2294,28 @@ export const getMarketplace = memoize(
 
     // Cache doesn't exist or is invalid, fetch from source
     let marketplace: PluginMarketplace
+    let cachePath: string
     try {
-      ;({ marketplace } = await loadAndCacheMarketplace(entry.source))
+      ;({ marketplace, cachePath } = await loadAndCacheMarketplace(
+        entry.source,
+      ))
     } catch (error) {
       throw new Error(
         `Failed to load marketplace "${name}" from source (${entry.source.source}): ${errorMessage(error)}`,
       )
     }
 
-    // Update lastUpdated only when we actually fetch
+    // Persist cachePath for remote sources: keep-temp recovery (#2183) may
+    // leave the live clone at temporaryCachePath instead of the canonical
+    // marketplace-name directory already stored in installLocation.
+    // Local file/directory sources do not go through rename/copy; cachePath is
+    // the user's marketplace root. Overwriting a stored manifest path with that
+    // root would make removeMarketplaceSource recursively delete the user's
+    // directory.
     config[name]!.lastUpdated = new Date().toISOString()
+    if (!isLocalMarketplaceSource(entry.source)) {
+      config[name]!.installLocation = cachePath
+    }
     await saveKnownMarketplacesConfig(config)
 
     return marketplace
@@ -2288,7 +2345,7 @@ export async function getPluginByIdCacheOnly(pluginId: string): Promise<{
 
   try {
     const content = await fs.readFile(configFile, { encoding: 'utf-8' })
-    const config = jsonParse(content) as KnownMarketplacesConfig
+    const config = toNullProtoConfig(jsonParse(content) as KnownMarketplacesConfig)
     const marketplaceConfig = config[marketplaceName]
 
     if (!marketplaceConfig) {
@@ -2354,9 +2411,16 @@ export async function getPluginById(pluginId: string): Promise<{
       return null
     }
 
+    // getMarketplace refetch may persist a keep-temp cachePath (#2183) that
+    // differs from the snapshot loaded above.
+    const refreshedConfig = await loadKnownMarketplacesConfig()
+    const installLocation =
+      refreshedConfig[marketplaceName]?.installLocation ??
+      marketplaceConfig.installLocation
+
     return {
       entry: plugin,
-      marketplaceInstallLocation: marketplaceConfig.installLocation,
+      marketplaceInstallLocation: installLocation,
     }
   } catch (error) {
     logForDebugging(

@@ -1,10 +1,18 @@
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { closeSync, openSync } from 'node:fs'
-import { open, readFile, unlink } from 'node:fs/promises'
+import { open, unlink } from 'node:fs/promises'
 import { basename } from 'node:path'
 import treeKill from 'tree-kill'
-import { argsBeforeDelimiter } from '../utils/cliArgs.js'
+import {
+  argsBeforeDelimiter,
+  parseModelFlagValue,
+} from '../utils/cliArgs.js'
+import {
+  argsBeforeModelOwningSubcommand,
+  hasPrintFlag,
+  parseRootOptionValue,
+} from '../utils/printFlag.js'
 import { isProcessRunning } from '../utils/genericProcessUtils.js'
 import {
   assertBackgroundSessionNameAvailable,
@@ -16,7 +24,20 @@ import {
   markBackgroundSessionKilled,
   refreshBackgroundSessionStatuses,
   resolveBackgroundSession,
+  getBackgroundSessionProcessLiveness,
+  isTerminalBackgroundSession,
+  verifyBackgroundSessionProcessIdentity,
+  type BackgroundSession,
+  type BackgroundSessionProcessIdentity,
+  type BackgroundSessionProcessIdentityOptions,
 } from './bgRegistry.js'
+import {
+  backgroundProcessMarkerToken,
+  BACKGROUND_SESSION_ID_ENV,
+  BACKGROUND_SESSION_LAUNCHER_PID_ENV,
+  generateBackgroundProcessMarker,
+  stripBackgroundProcessMarkerArgs,
+} from './bgRouting.js'
 
 export type ParsedBackgroundInvocation = {
   name?: string
@@ -44,6 +65,9 @@ export type BuildBackgroundChildProcessConfigInput = {
   processEnv: NodeJS.ProcessEnv
   sessionName?: string
   stdoutLogPath: string
+  backgroundSessionId: string
+  processMarker: string
+  launcherPid?: number
 }
 
 type PrResumeSelector = true | string
@@ -55,9 +79,55 @@ export type BuildBackgroundSessionLaunchDeps = {
 }
 
 const HEAP_RELAUNCHED_ENV = 'OPENCLAUDE_HEAP_RELAUNCHED'
+const HEAP_SIZE_ENV = 'OPENCLAUDE_NODE_MAX_OLD_SPACE_SIZE_MB'
+const DEFAULT_HEAP_SIZE_MB = 8192
 const DEFAULT_TERM_GRACE_MS = 2_000
 const DEFAULT_KILL_GRACE_MS = 2_000
 const DEFAULT_KILL_POLL_INTERVAL_MS = 100
+// Each background-log read buffer is capped at 64 KiB to avoid whole-log allocations.
+export const LOG_STREAM_CHUNK_SIZE = 64 * 1024
+const LOG_FOLLOW_POLL_INTERVAL_MS = 500
+
+type LogOutput = {
+  destroyed?: boolean
+  writableDestroyed?: boolean
+  write(chunk: Uint8Array): boolean
+  once(event: string, listener: (...args: unknown[]) => void): unknown
+  off(event: string, listener: (...args: unknown[]) => void): unknown
+}
+
+type LogFileHandle = {
+  close(): Promise<void>
+  stat(): Promise<{ size: number }>
+  read(
+    buffer: Buffer,
+    offset: number,
+    length: number,
+    position: number,
+  ): Promise<{ bytesRead: number }>
+}
+
+type LogFollowTimer = ReturnType<typeof setInterval> | number
+
+type StreamLogOptions = {
+  output?: LogOutput
+  chunkSize?: number
+  createBuffer?: (size: number) => Buffer
+  signal?: AbortSignal
+  openFile?: (path: string, flags: 'r') => Promise<LogFileHandle>
+  continueOnFileError?: boolean
+}
+
+type FollowLogOptions = StreamLogOptions & {
+  pollIntervalMs?: number
+  setInterval?: (callback: () => void, ms: number) => LogFollowTimer
+  clearInterval?: (timer: LogFollowTimer) => void
+}
+
+type StreamLogResult = {
+  position: number
+  outputOpen: boolean
+}
 
 // This must stay in sync with value-consuming CLI flags in main.tsx and related
 // handlers. If the CLI flag definitions become centralized, move this parser
@@ -90,6 +160,7 @@ const REQUIRED_OPTION_VALUE_FLAGS = new Set([
   '--plugin-dir',
   '--prefill',
   '--provider',
+  '--provider-env-file',
   '--resume-session-at',
   '--rewind-files',
   '--session-id',
@@ -114,13 +185,71 @@ const SPACE_OPTIONAL_VALUE_FLAGS = new Set([
   '-r',
 ])
 
-function safeNodeExecArgvForBackground(execArgv: string[]): string[] {
-  return execArgv.filter(
-    arg =>
-      arg === '--expose-gc' ||
-      arg.startsWith('--max-old-space-size') ||
-      arg.startsWith('--heapsnapshot-near-heap-limit'),
+function isNodeExecutable(execPath: string): boolean {
+  return /^node(?:\.exe)?$/i.test(basename(execPath))
+}
+
+function hasNodeFlag(args: string[], flag: string): boolean {
+  return args.some(arg => arg === flag || arg.startsWith(`${flag}=`))
+}
+
+function hasHeapLimitFlag(args: string[]): boolean {
+  return (
+    hasNodeFlag(args, '--max-old-space-size') ||
+    hasNodeFlag(args, '--max-old-space-size-percentage')
   )
+}
+
+function keepBackgroundNodeExecArg(arg: string): boolean {
+  return (
+    arg === '--expose-gc' ||
+    arg.startsWith('--max-old-space-size') ||
+    arg.startsWith('--heapsnapshot-near-heap-limit')
+  )
+}
+
+function isValueTakingHeapExecArg(arg: string): boolean {
+  return (
+    arg === '--max-old-space-size' ||
+    arg === '--max-old-space-size-percentage' ||
+    arg === '--heapsnapshot-near-heap-limit'
+  )
+}
+
+function safeNodeExecArgvForBackground(
+  execPath: string,
+  execArgv: string[],
+  processEnv: NodeJS.ProcessEnv,
+): string[] {
+  const safeArgs: string[] = []
+  for (let i = 0; i < execArgv.length; i++) {
+    const arg = execArgv[i]
+    if (!keepBackgroundNodeExecArg(arg)) continue
+    safeArgs.push(arg)
+    const next = execArgv[i + 1]
+    if (isValueTakingHeapExecArg(arg) && next && !next.startsWith('-')) {
+      i += 1
+      safeArgs.push(next)
+    }
+  }
+  if (!isNodeExecutable(execPath)) return safeArgs
+
+  const nodeOptions = (processEnv.NODE_OPTIONS ?? '')
+    .split(/\s+/)
+    .filter(Boolean)
+  const effectiveArgs = [...safeArgs, ...nodeOptions]
+  if (!hasHeapLimitFlag(effectiveArgs)) {
+    const configuredHeap = Number.parseInt(processEnv[HEAP_SIZE_ENV] ?? '', 10)
+    const heapSize =
+      Number.isSafeInteger(configuredHeap) && configuredHeap > 0
+        ? configuredHeap
+        : DEFAULT_HEAP_SIZE_MB
+    safeArgs.push(`--max-old-space-size=${heapSize}`)
+  }
+  if (!hasNodeFlag(effectiveArgs, '--expose-gc')) {
+    safeArgs.push('--expose-gc')
+  }
+  return safeArgs
 }
 
 export function buildBackgroundChildProcessConfig(
@@ -134,15 +263,28 @@ export function buildBackgroundChildProcessConfig(
     ...(input.sessionName
       ? { CLAUDE_CODE_SESSION_NAME: input.sessionName }
       : {}),
+    [BACKGROUND_SESSION_ID_ENV]: input.backgroundSessionId,
+    [BACKGROUND_SESSION_LAUNCHER_PID_ENV]: String(
+      input.launcherPid ?? process.pid,
+    ),
   }
-  delete env[HEAP_RELAUNCHED_ENV]
+  // Keep the registered detached PID stable under every runtime. The installed
+  // launcher otherwise relaunches itself before finalizer ownership is checked.
+  // Node-only heap flags are still supplied by safeNodeExecArgvForBackground.
+  env[HEAP_RELAUNCHED_ENV] = '1'
+  const childArgs = stripBackgroundProcessMarkerArgs(input.childArgs)
 
   return {
     command: input.execPath,
     args: [
-      ...safeNodeExecArgvForBackground(input.execArgv),
+      ...safeNodeExecArgvForBackground(
+        input.execPath,
+        input.execArgv,
+        input.processEnv,
+      ),
       input.entrypoint,
-      ...input.childArgs,
+      backgroundProcessMarkerToken(input.processMarker),
+      ...childArgs,
     ],
     env,
   }
@@ -234,9 +376,26 @@ function findSessionName(args: string[]): string | undefined {
   return findFlagValue(args, '--name') ?? findFlagValue(args, '-n')
 }
 
+/**
+ * Background session metadata must record the same root `--model` that CLI
+ * startup applies. Nested `aimlapi topup` / `auto-mode critique` flags are not
+ * the session model.
+ */
+export function resolveBackgroundSessionModel(
+  childArgs: readonly string[],
+): string | undefined {
+  return parseModelFlagValue(argsBeforeModelOwningSubcommand(childArgs))
+}
+
+/** Keep registry metadata aligned with the provider selected by CLI startup. */
+export function resolveBackgroundSessionProvider(
+  childArgs: readonly string[],
+): string | undefined {
+  return parseRootOptionValue(childArgs, '--provider')
+}
+
 function hasPrintMode(args: string[]): boolean {
-  const searchable = argsBeforeDelimiter(args)
-  return searchable.includes('--print') || searchable.includes('-p')
+  return hasPrintFlag(args)
 }
 
 function insertBeforePrompt(args: string[], values: string[]): string[] {
@@ -332,7 +491,7 @@ export async function buildBackgroundSessionLaunch(
 export function parseBackgroundInvocation(
   args: string[],
 ): ParsedBackgroundInvocation {
-  let childArgs = stripBackgroundFlag(args)
+  let childArgs = stripBackgroundProcessMarkerArgs(stripBackgroundFlag(args))
   const name = findSessionName(childArgs)?.trim() || undefined
   const promptIndex = findPromptIndex(childArgs)
   const prompt = promptIndex === -1 ? undefined : childArgs[promptIndex]
@@ -382,6 +541,21 @@ function formatCommand(command: string[]): string {
     .join(' ')
 }
 
+export function buildBackgroundSessionDisplayCommand(
+  command: string[],
+  processMarker: string,
+): string[] {
+  const markerToken = backgroundProcessMarkerToken(processMarker)
+  const delimiterIndex = command.indexOf('--')
+  const optionEnd = delimiterIndex === -1 ? command.length : delimiterIndex
+  const markerIndex = command.findIndex(
+    (arg, index) => index < optionEnd && arg === markerToken,
+  )
+  return markerIndex === -1
+    ? [...command]
+    : [...command.slice(0, markerIndex), ...command.slice(markerIndex + 1)]
+}
+
 function printSessionTable(
   sessions: Awaited<ReturnType<typeof listBackgroundSessions>>,
 ): void {
@@ -410,56 +584,216 @@ function printSessionTable(
   }
 }
 
-async function printExistingLog(path: string): Promise<number> {
+function isOutputClosed(output: LogOutput): boolean {
+  return output.destroyed === true || output.writableDestroyed === true
+}
+
+function normalizeChunkSize(chunkSize: number | undefined): number {
+  if (!Number.isFinite(chunkSize) || !chunkSize || chunkSize < 1) {
+    return LOG_STREAM_CHUNK_SIZE
+  }
+  return Math.floor(chunkSize)
+}
+
+async function waitForDrain(
+  output: LogOutput,
+  signal: AbortSignal | undefined,
+): Promise<boolean> {
+  if (signal?.aborted || isOutputClosed(output)) return false
+
+  return await new Promise<boolean>(resolve => {
+    let settled = false
+
+    const cleanup = () => {
+      output.off('drain', onDrain)
+      output.off('error', onError)
+      output.off('close', onClose)
+      signal?.removeEventListener('abort', onAbort)
+    }
+    const finish = (open: boolean) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      resolve(open)
+    }
+
+    const onDrain = () => finish(!isOutputClosed(output))
+    const onError = () => finish(false)
+    const onClose = () => finish(false)
+    const onAbort = () => finish(false)
+
+    output.once('drain', onDrain)
+    output.once('error', onError)
+    output.once('close', onClose)
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+async function writeLogBuffer(
+  output: LogOutput,
+  buffer: Buffer,
+  signal: AbortSignal | undefined,
+): Promise<boolean> {
+  if (buffer.length === 0) return true
+  if (signal?.aborted || isOutputClosed(output)) return false
+
   try {
-    const contents = await readFile(path)
-    if (contents.length > 0) process.stdout.write(contents)
-    return contents.length
+    if (output.write(buffer)) return !isOutputClosed(output)
   } catch {
-    return 0
+    return false
+  }
+
+  return await waitForDrain(output, signal)
+}
+
+async function streamLogRange(
+  handle: LogFileHandle,
+  start: number,
+  endExclusive: number,
+  options: StreamLogOptions,
+): Promise<StreamLogResult> {
+  const output = options.output ?? process.stdout
+  const chunkSize = normalizeChunkSize(options.chunkSize)
+  const createBuffer = options.createBuffer ?? Buffer.allocUnsafe
+  let position = start
+
+  while (position < endExclusive) {
+    if (options.signal?.aborted) return { position, outputOpen: false }
+    const bytesToRead = Math.min(chunkSize, endExclusive - position)
+    const buffer = createBuffer(bytesToRead)
+    if (buffer.length < bytesToRead) {
+      throw new Error('Log stream buffer factory returned a short buffer')
+    }
+
+    let bytesRead: number
+    try {
+      const readResult = await handle.read(buffer, 0, bytesToRead, position)
+      bytesRead = readResult.bytesRead
+    } catch (error) {
+      if (!options.continueOnFileError) throw error
+      return { position, outputOpen: true }
+    }
+    if (bytesRead <= 0) break
+    if (options.signal?.aborted) return { position, outputOpen: false }
+
+    const chunk =
+      bytesRead === buffer.length ? buffer : buffer.subarray(0, bytesRead)
+    if (!(await writeLogBuffer(output, chunk, options.signal))) {
+      return { position, outputOpen: false }
+    }
+    position += bytesRead
+  }
+
+  return { position, outputOpen: true }
+}
+
+async function streamLogSnapshot(
+  path: string,
+  offset: number,
+  options: StreamLogOptions,
+): Promise<StreamLogResult> {
+  let handle: LogFileHandle
+  try {
+    handle = await (options.openFile ?? open)(path, 'r')
+  } catch (error) {
+    if (!options.continueOnFileError) throw error
+    // Keep following; the child may create or rotate the file later.
+    return { position: offset, outputOpen: true }
+  }
+
+  let result: StreamLogResult = { position: offset, outputOpen: true }
+  try {
+    const { size } = await handle.stat()
+    const start = size < offset ? 0 : offset
+    result =
+      size <= start
+        ? { position: start, outputOpen: true }
+        : await streamLogRange(handle, start, size, options)
+    return result
+  } catch (error) {
+    if (!options.continueOnFileError) throw error
+    return result
+  } finally {
+    if (options.continueOnFileError) {
+      await handle.close().catch(() => undefined)
+    } else {
+      await handle.close()
+    }
   }
 }
 
-async function followLogFile(path: string, offset: number): Promise<void> {
+export async function printExistingLog(
+  path: string,
+  options: StreamLogOptions = {},
+): Promise<number> {
+  const result = await streamLogSnapshot(path, 0, options)
+  return result.position
+}
+
+export async function followLogFile(
+  path: string,
+  offset: number,
+  options: FollowLogOptions = {},
+): Promise<void> {
+  const output = options.output ?? process.stdout
+  const cleanupController = new AbortController()
   let position = offset
   let reading = false
+  let stopped = false
+  let timer: LogFollowTimer | undefined
+  let activePoll: Promise<void> | undefined
 
   await new Promise<void>(resolve => {
     const cleanup = () => {
-      clearInterval(timer)
+      if (stopped) return
+      stopped = true
+      if (timer) (options.clearInterval ?? clearInterval)(timer)
+      cleanupController.abort()
       process.off('SIGINT', cleanup)
       process.off('SIGTERM', cleanup)
-      resolve()
+      options.signal?.removeEventListener('abort', cleanup)
+      const pendingPoll = activePoll
+      if (pendingPoll) {
+        void pendingPoll.finally(resolve)
+      } else {
+        resolve()
+      }
     }
 
-    const timer = setInterval(() => {
-      if (reading) return
+    const poll = () => {
+      if (stopped || reading) return
       reading = true
-      void (async () => {
+      const pollPromise = (async () => {
         try {
-          const handle = await open(path, 'r')
-          try {
-            const { size } = await handle.stat()
-            if (size < position) position = 0
-            if (size > position) {
-              const buffer = Buffer.alloc(size - position)
-              await handle.read(buffer, 0, buffer.length, position)
-              position = size
-              process.stdout.write(buffer)
-            }
-          } finally {
-            await handle.close()
-          }
-        } catch {
-          // Keep following; the child may create or rotate the file later.
+          const result = await streamLogSnapshot(path, position, {
+            ...options,
+            output,
+            signal: cleanupController.signal,
+            continueOnFileError: true,
+          })
+          position = result.position
+          if (!result.outputOpen) cleanup()
         } finally {
           reading = false
         }
       })()
-    }, 500)
+      activePoll = pollPromise
+      void pollPromise.finally(() => {
+        if (activePoll === pollPromise) activePoll = undefined
+      })
+    }
 
     process.once('SIGINT', cleanup)
     process.once('SIGTERM', cleanup)
+    if (options.signal?.aborted) {
+      cleanup()
+      return
+    }
+    options.signal?.addEventListener('abort', cleanup, { once: true })
+    timer = (options.setInterval ?? setInterval)(
+      poll,
+      options.pollIntervalMs ?? LOG_FOLLOW_POLL_INTERVAL_MS,
+    )
   })
 }
 
@@ -515,6 +849,10 @@ export async function terminateBackgroundProcessTree(
     termGraceMs?: number
     killGraceMs?: number
     pollIntervalMs?: number
+    verifyBeforeSignal?: (
+      pid: number,
+      signal: string | number,
+    ) => Promise<'matches' | 'not-running'>
   },
 ): Promise<void> {
   const isProcessAlive = options?.isProcessAlive ?? isProcessRunning
@@ -523,7 +861,13 @@ export async function terminateBackgroundProcessTree(
   const pollIntervalMs =
     options?.pollIntervalMs ?? DEFAULT_KILL_POLL_INTERVAL_MS
 
-  if (!isProcessAlive(pid)) return
+  if (options?.verifyBeforeSignal) {
+    if ((await options.verifyBeforeSignal(pid, 'SIGTERM')) === 'not-running') {
+      return
+    }
+  } else if (!isProcessAlive(pid)) {
+    return
+  }
   await killTree(pid, 'SIGTERM')
   if (
     await waitForProcessExit(pid, {
@@ -536,6 +880,9 @@ export async function terminateBackgroundProcessTree(
     return
   }
 
+  if ((await options?.verifyBeforeSignal?.(pid, 'SIGKILL')) === 'not-running') {
+    return
+  }
   await killTree(pid, 'SIGKILL')
   if (
     await waitForProcessExit(pid, {
@@ -549,6 +896,155 @@ export async function terminateBackgroundProcessTree(
   }
 
   throw new Error(`Process ${pid} did not exit after SIGKILL`)
+}
+
+type BackgroundSessionTerminationOptions = BackgroundSessionProcessIdentityOptions & {
+  killTree?: (pid: number, signal: string | number) => Promise<void>
+  sleep?: (ms: number) => Promise<void>
+  termGraceMs?: number
+  killGraceMs?: number
+  pollIntervalMs?: number
+  verifySessionIdentity?: (
+    session: BackgroundSession,
+  ) => BackgroundSessionProcessIdentity
+}
+
+function unverifiedProcessError(
+  session: BackgroundSession,
+  reason: string,
+): Error {
+  const action =
+    session.processMarker === undefined
+      ? `This older background session could not be verified safely. Restart it to use stronger process identity, or terminate PID ${session.pid} manually after confirming ownership.`
+      : 'Re-run `openclaude ps` and retry after confirming the session identity.'
+  return new Error(
+    `OpenClaude refused to signal an unverified process for background session ${session.id} (PID ${session.pid}): ${reason}. ${action}`,
+  )
+}
+
+export async function terminateBackgroundSessionProcessTree(
+  session: BackgroundSession,
+  options: BackgroundSessionTerminationOptions = {},
+): Promise<void> {
+  const getLiveness = (pid: number) =>
+    getBackgroundSessionProcessLiveness(pid, options)
+
+  await terminateBackgroundProcessTree(session.pid, {
+    ...options,
+    isProcessAlive: pid => getLiveness(pid) !== 'not-running',
+    verifyBeforeSignal: async pid => {
+      const identity = verifySelectedBackgroundSessionIdentity(session, options)
+      if (pid !== session.pid) {
+        throw unverifiedProcessError(
+          session,
+          'the identity check did not correspond to the selected session and PID',
+        )
+      }
+      return authorizeBackgroundSessionSignal(session, identity)
+    },
+  })
+}
+
+function verifySelectedBackgroundSessionIdentity(
+  session: BackgroundSession,
+  options: BackgroundSessionTerminationOptions,
+): BackgroundSessionProcessIdentity {
+  let identity: BackgroundSessionProcessIdentity
+  if (options.verifySessionIdentity) {
+    try {
+      identity = options.verifySessionIdentity(session)
+    } catch {
+      throw unverifiedProcessError(
+        session,
+        'the live process identity could not be read',
+      )
+    }
+  } else {
+    identity = verifyBackgroundSessionProcessIdentity(session, options)
+  }
+  if (
+    identity.backgroundSessionId !== session.id ||
+    identity.pid !== session.pid
+  ) {
+    throw unverifiedProcessError(
+      session,
+      'the identity check did not correspond to the selected session and PID',
+    )
+  }
+  return identity
+}
+
+function authorizeBackgroundSessionSignal(
+  session: BackgroundSession,
+  identity: BackgroundSessionProcessIdentity,
+): 'matches' | 'not-running' {
+  if (identity.state === 'not-running') return 'not-running'
+  if (identity.state === 'matches') return 'matches'
+  throw unverifiedProcessError(
+    session,
+    identity.state === 'mismatch'
+      ? 'the PID now belongs to a different process'
+      : 'the live process identity could not be read',
+  )
+}
+
+export async function killBackgroundSession(
+  session: BackgroundSession,
+  options: BackgroundSessionTerminationOptions & {
+    markKilled?: (session: BackgroundSession) => Promise<BackgroundSession>
+  } = {},
+): Promise<BackgroundSession> {
+  const markKilled =
+    options.markKilled ??
+    (async (selected: BackgroundSession) =>
+      await markBackgroundSessionKilled(selected.id))
+
+  if (session.status !== 'stale' && isTerminalBackgroundSession(session)) {
+    return await markKilled(session)
+  }
+
+  const identity = verifySelectedBackgroundSessionIdentity(session, options)
+  const authorization = authorizeBackgroundSessionSignal(session, identity)
+  if (
+    authorization === 'matches' &&
+    session.status === 'stale' &&
+    session.processMarker === undefined
+  ) {
+    throw unverifiedProcessError(
+      session,
+      'this older session was already stale, so its PID ownership cannot be re-established safely',
+    )
+  }
+  if (authorization === 'matches') {
+    await terminateBackgroundSessionProcessTree(session, options)
+  }
+
+  return await markKilled(session)
+}
+
+type ConfirmBackgroundSessionLaunchOptions = {
+  isProcessAlive?: (pid: number) => boolean
+  refreshStatuses?: () => Promise<BackgroundSession[]>
+  resolveSession?: (id: string) => Promise<BackgroundSession>
+}
+
+export async function confirmBackgroundSessionLaunch(
+  session: BackgroundSession,
+  options: ConfirmBackgroundSessionLaunchOptions = {},
+): Promise<BackgroundSession> {
+  if ((options.isProcessAlive ?? isProcessRunning)(session.pid)) return session
+
+  await (options.refreshStatuses ?? refreshBackgroundSessionStatuses)()
+  const resolved = await (
+    options.resolveSession ?? resolveBackgroundSession
+  )(session.id)
+  if (resolved.status === 'stale') {
+    throw new Error(
+      `Background session ${session.id} exited before finalization was installed. ` +
+        `Logs were retained at ${session.stdoutLogPath} and ${session.stderrLogPath}.`,
+    )
+  }
+  return resolved
 }
 
 export async function psHandler(_args: string[]): Promise<void> {
@@ -571,7 +1067,14 @@ export async function logsHandler(
     fail(`Log file does not exist: ${logPath}`)
   }
 
-  const offset = await printExistingLog(logPath)
+  let offset: number
+  try {
+    offset = await printExistingLog(logPath, {
+      continueOnFileError: parsed.follow,
+    })
+  } catch (error) {
+    fail(`Failed to read log file: ${errorMessage(error)}`)
+  }
   if (parsed.follow) {
     await followLogFile(logPath, offset)
   }
@@ -593,26 +1096,31 @@ export async function attachHandler(
 
 export async function killHandler(
   args: string[] | string | undefined,
+  options: { retentionSettingsReady?: boolean } = {},
 ): Promise<void> {
   const target = normalizeArgs(args)[0]
   if (!target) fail('Usage: openclaude kill <id-or-name>')
 
   await refreshBackgroundSessionStatuses()
   const session = await resolveSessionOrExit(target)
-  if (session.status === 'unknown' && isProcessRunning(session.pid)) {
+  const killed = await killBackgroundSession(session).catch(error => {
     fail(
-      `Cannot safely kill background session ${session.id}: process identity could not be verified`,
+      `Failed to kill background session ${session.id}: ${errorMessage(error)}`,
     )
-  }
-  if (session.status === 'running' && isProcessRunning(session.pid)) {
-    await terminateBackgroundProcessTree(session.pid).catch(error => {
-      fail(
-        `Failed to kill background session ${session.id}: ${errorMessage(error)}`,
+  })
+  if (options.retentionSettingsReady !== false) {
+    try {
+      const { runBackgroundSessionRetention } = await import(
+        '../utils/cleanup.js'
       )
-    })
+      await runBackgroundSessionRetention({
+        trigger: 'explicit-kill',
+        sessionId: killed.id,
+      })
+    } catch {
+      // A retention failure must not replace the successful kill outcome.
+    }
   }
-
-  const killed = await markBackgroundSessionKilled(session.id)
   console.log(`Killed background session ${killed.id}.`)
 }
 
@@ -629,6 +1137,7 @@ export async function handleBgFlag(args: string[]): Promise<void> {
   }
 
   const id = backgroundSessionId()
+  const processMarker = generateBackgroundProcessMarker()
   const { childArgs, sessionId } = await buildBackgroundSessionLaunch(
     parsed.childArgs,
     randomUUID(),
@@ -649,6 +1158,9 @@ export async function handleBgFlag(args: string[]): Promise<void> {
     processEnv: process.env,
     sessionName: parsed.name,
     stdoutLogPath: logPaths.stdoutLogPath,
+    backgroundSessionId: id,
+    processMarker,
+    launcherPid: process.pid,
   })
 
   let stdoutFd: number | undefined
@@ -694,15 +1206,16 @@ export async function handleBgFlag(args: string[]): Promise<void> {
   }
 
   const command = [childConfig.command, ...childConfig.args]
-  const session = await createBackgroundSession({
+  let session = await createBackgroundSession({
     id,
     name: parsed.name,
     pid: child.pid,
     cwd: process.cwd(),
     command,
-    provider: findFlagValue(childArgs, '--provider'),
-    model: findFlagValue(childArgs, '--model'),
+    provider: resolveBackgroundSessionProvider(childArgs),
+    model: resolveBackgroundSessionModel(childArgs),
     sessionId,
+    processMarker,
     stdoutLogPath: logPaths.stdoutLogPath,
     stderrLogPath: logPaths.stderrLogPath,
     logFilesPrecreated: true,
@@ -712,12 +1225,25 @@ export async function handleBgFlag(args: string[]): Promise<void> {
     fail(errorMessage(error))
   })
 
-  console.log(`Started background session ${session.id}.`)
+  session = await confirmBackgroundSessionLaunch(session).catch(error => {
+    fail(errorMessage(error))
+  })
+
+  console.log(
+    isTerminalBackgroundSession(session)
+      ? `Background session ${session.id} finished with status ${session.status}.`
+      : `Started background session ${session.id}.`,
+  )
   if (session.name) console.log(`Name: ${session.name}`)
   console.log(`PID: ${session.pid}`)
   console.log(`Logs: ${session.stdoutLogPath}`)
   console.log(`Follow: openclaude logs ${session.id} -f`)
   console.log(
-    `Command: ${formatCommand([basename(childConfig.command), ...childConfig.args])}`,
+    `Command: ${formatCommand(
+      buildBackgroundSessionDisplayCommand([
+        basename(childConfig.command),
+        ...childConfig.args,
+      ], processMarker),
+    )}`,
   )
 }

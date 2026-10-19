@@ -6,7 +6,7 @@
  */
 
 import type { ContentBlockParam } from '@anthropic-ai/sdk/resources/index.mjs'
-import { randomUUID } from 'crypto'
+import { randomUUID, type UUID } from 'crypto'
 import { dirname } from 'path'
 import { QueryEngine } from '../../QueryEngine.js'
 import {
@@ -18,8 +18,9 @@ import {
   getEmptyToolPermissionContext,
   type ToolPermissionContext,
 } from '../../Tool.js'
-import { getTools } from '../../tools.js'
+import { assembleToolPool, getTools } from '../../tools.js'
 import { createFileStateCacheWithSizeLimit } from '../../utils/fileStateCache.js'
+import { requestSdkRootAbort } from './interruption.js'
 import { init } from '../init.js'
 import {
   resolveSessionFilePath,
@@ -32,10 +33,14 @@ import {
   switchSession,
   regenerateSessionId,
   getSessionId,
-  runWithSdkContext,
+  bindSdkContextToAsyncGenerator,
+  runOutsideSdkContext,
 } from '../../bootstrap/state.js'
 import type { SessionId } from '../../types/ids.js'
-import { getAgentDefinitionsWithOverrides } from '../../tools/AgentTool/loadAgentsDir.js'
+import {
+  getAgentDefinitionsWithOverrides,
+  type AgentDefinitionsResult,
+} from '../../tools/AgentTool/loadAgentsDir.js'
 import type {
   RewindFilesResult,
   McpServerStatus,
@@ -81,6 +86,11 @@ import {
   buildConversationChain,
   stripExtraFields,
 } from './transcript.js'
+import {
+  buildSdkUserAgents,
+  mergeSdkUserAgents,
+  type SdkAgentDefinitionInput,
+} from './agentDefinitions.js'
 
 // ============================================================================
 // QueryOptions type
@@ -150,14 +160,7 @@ export type QueryOptions = {
     | { type: 'preset'; preset: string; append?: string }
     | { type: 'custom'; content: string }
   /** Agent definitions to register with the query engine. */
-  agents?: Record<string, {
-    description: string
-    prompt: string
-    tools?: string[]
-    disallowedTools?: string[]
-    model?: string
-    maxTurns?: number
-  }>
+  agents?: Record<string, SdkAgentDefinitionInput>
   /** Setting sources to load. */
   settingSources?: string[]
   /** When true, yields stream_event messages for token-by-token streaming. */
@@ -395,6 +398,7 @@ class QueryImpl implements Query {
   private resumeSessionAt?: string
   private userAgents?: QueryOptions['agents']
   private mcpServers?: Record<string, unknown>
+  private sdkMcpTools: Parameters<typeof assembleToolPool>[1] = []
   private permissionContext: ToolPermissionContext
   private timeoutQueue: SDKPermissionTimeoutMessage[] = []
   private agentFailureQueue: SDKAgentLoadFailureMessage[] = []
@@ -507,8 +511,9 @@ class QueryImpl implements Query {
     }
 
     const self = this
-    const inner = runWithSdkContext(sdkContext, () => {
-      return (async function* (): AsyncGenerator<SDKMessage> {
+    const inner = bindSdkContextToAsyncGenerator(
+      sdkContext,
+      (async function* (): AsyncGenerator<SDKMessage> {
         // Fast exit: if interrupt()/close() was called before iteration
         // started, skip init entirely — avoids auth/network side-effects.
         if (self.abortController.signal.aborted) return
@@ -516,69 +521,78 @@ class QueryImpl implements Query {
         // Skip init for mock/host-injected engines; they are self-contained.
         const engineWasOverridden = self._engineWasInjected
         if (!engineWasOverridden) {
-          await init()
+          await runOutsideSdkContext(init)
         }
 
         // Load agent definitions BEFORE creating engine context
-        let agentDefs: { activeAgents: any[]; allAgents: any[] } = { activeAgents: [], allAgents: [] }
-          try {
-            agentDefs = await getAgentDefinitionsWithOverrides(self.cwd)
-          } catch (err) {
-            // Agent loading failed — continue without agents but emit failure event
-            const errorMessage = err instanceof Error ? err.message : String(err)
-            console.warn('SDK: agent definitions loading failed:', errorMessage)
+        let agentDefs: AgentDefinitionsResult = { activeAgents: [], allAgents: [] }
+        const reportDefinitionFailure = (errorMessage: string) => {
+          self.pushAgentFailure({
+            type: 'agent_load_failure',
+            stage: 'definitions',
+            error_message: errorMessage,
+          })
+        }
+        try {
+          agentDefs = await getAgentDefinitionsWithOverrides(self.cwd)
+          for (const failedFile of agentDefs.failedFiles ?? []) {
+            reportDefinitionFailure(
+              `Failed to load agent definition '${failedFile.path}': ${failedFile.error}`,
+            )
+          }
+        } catch (err) {
+          // Agent loading failed — continue without agents but emit failure event
+          const errorMessage = err instanceof Error ? err.message : String(err)
+          console.warn('SDK: agent definitions loading failed:', errorMessage)
+          reportDefinitionFailure(errorMessage)
+        }
+
+        // Inject agents into the engine
+        const userAgents = buildSdkUserAgents(
+          self.userAgents,
+          (name, errorMessage) => {
             self.pushAgentFailure({
               type: 'agent_load_failure',
-              stage: 'definitions',
+              stage: 'injection',
+              error_message: `Invalid SDK agent '${name}': ${errorMessage}`,
+            })
+          },
+        )
+        const mergedAgentDefs = mergeSdkUserAgents(agentDefs, userAgents)
+        if (mergedAgentDefs.activeAgents.length > 0) {
+          self.appStateStore.setState(prev => ({
+            ...prev,
+            agentDefinitions: mergedAgentDefs,
+          }))
+          try {
+            self.engine.injectAgents(mergedAgentDefs.activeAgents)
+          } catch (err) {
+            // Agent injection failed — continue without agents but emit failure event
+            const errorMessage = err instanceof Error ? err.message : String(err)
+            console.warn('SDK: agent injection failed:', errorMessage)
+            self.appStateStore.setState(prev => ({
+              ...prev,
+              agentDefinitions: { activeAgents: [], allAgents: [] },
+            }))
+            self.pushAgentFailure({
+              type: 'agent_load_failure',
+              stage: 'injection',
               error_message: errorMessage,
             })
           }
-
-          // Update AppState with agents
+        } else {
           self.appStateStore.setState(prev => ({
             ...prev,
-            agentDefinitions: agentDefs,
+            agentDefinitions: mergedAgentDefs,
           }))
+        }
 
-          // Inject agents into the engine
-          if (self.userAgents && Object.keys(self.userAgents).length > 0) {
-            const userAgents: Array<{
-              agentType: string
-              whenToUse: string
-              getSystemPrompt: () => string
-              tools?: string[]
-              disallowedTools?: string[]
-              model?: string
-              maxTurns?: number
-            }> = Object.entries(self.userAgents).map(([name, def]) => ({
-              agentType: name,
-              whenToUse: def.description ?? name,
-              getSystemPrompt: () => def.prompt ?? '',
-              ...(def.tools ? { tools: def.tools } : {}),
-              ...(def.disallowedTools ? { disallowedTools: def.disallowedTools } : {}),
-              ...(def.model ? { model: def.model } : {}),
-              ...(def.maxTurns ? { maxTurns: def.maxTurns } : {}),
-            }))
-            agentDefs.activeAgents.push(...userAgents)
-          }
-          if (agentDefs.activeAgents.length > 0) {
-            try {
-              self.engine.injectAgents(agentDefs.activeAgents)
-            } catch (err) {
-              // Agent injection failed — continue without agents but emit failure event
-              const errorMessage = err instanceof Error ? err.message : String(err)
-              console.warn('SDK: agent injection failed:', errorMessage)
-              self.pushAgentFailure({
-                type: 'agent_load_failure',
-                stage: 'injection',
-                error_message: errorMessage,
-              })
-            }
-          }
-
+        let envMutexAcquired = false
+        try {
           // Apply env overrides AFTER init() with full-duration mutex (SEC-1)
           if (hasEnvOverrides) {
             await acquireEnvMutex()
+            envMutexAcquired = true
             self.envSnapshot = {}
             for (const key of Object.keys(self.envOverrides!)) {
               self.envSnapshot[key] = process.env[key]
@@ -592,103 +606,103 @@ class QueryImpl implements Query {
             }
           }
 
-          try {
-            // Connect MCP servers if provided
-            if (self.mcpServers && Object.keys(self.mcpServers).length > 0) {
-              try {
-                const { clients: mcpClients, tools: mcpTools } = await connectSdkMcpServers(self.mcpServers)
-                if (mcpClients.length > 0) {
-                  self.engine.setMcpClients(mcpClients)
-                }
-                if (mcpTools.length > 0) {
-                  const allTools = [...getTools(self.permissionContext)]  // Mutable copy
-                  for (const mcpTool of mcpTools) {
-                    if (!allTools.some(t => t.name === mcpTool.name)) {
-                      allTools.push(mcpTool)
-                    }
-                  }
-                  self.engine.updateTools(allTools)
-                }
-              } catch (err) {
-                // MCP connection failed — continue without MCP tools
-                console.warn('SDK: MCP server connection failed:', err instanceof Error ? err.message : String(err))
+          // Connect MCP servers if provided
+          if (self.mcpServers && Object.keys(self.mcpServers).length > 0) {
+            try {
+              const { clients: mcpClients, tools: mcpTools } = await connectSdkMcpServers(self.mcpServers)
+              self.sdkMcpTools = mcpTools
+              if (mcpClients.length > 0) {
+                self.engine.setMcpClients(mcpClients)
               }
+              if (mcpTools.length > 0) {
+                self.engine.updateTools(assembleToolPool(self.permissionContext, mcpTools))
+              }
+            } catch (err) {
+              // MCP connection failed — continue without MCP tools
+              console.warn('SDK: MCP server connection failed:', err instanceof Error ? err.message : String(err))
             }
+          }
 
-            // Handle continue/fork/resume session resolution
-            let effectiveSessionId: string | undefined = self._sessionId
-            let resolvedTranscriptDir: string | null = null
+          // Handle continue/fork/resume session resolution
+          let effectiveSessionId: string | undefined = self._sessionId
+          let resolvedTranscriptDir: string | null = null
 
-            if (self.continueSession && !self._sessionIdExplicitlyProvided) {
-              const sessions = await listSessions({ dir: self.cwd, limit: 1 })
-              if (sessions.length > 0) {
-                effectiveSessionId = sessions[0].sessionId
-                const result = await loadAndInjectSessionMessages(effectiveSessionId, self.cwd, self.engine, self.resumeSessionAt)
-                if (result.loaded) {
-                  resolvedTranscriptDir = result.transcriptDir
-                } else {
-                  effectiveSessionId = undefined
-                }
-              } else {
-                // No existing sessions — keep the constructor-created UUID for fresh query
-                effectiveSessionId = self._sessionId
-              }
-            } else if (self.shouldFork && self._sessionId) {
-              try {
-                const forkResult = await forkSession(self._sessionId, { dir: self.cwd })
-                effectiveSessionId = forkResult.sessionId
-                const result = await loadAndInjectSessionMessages(effectiveSessionId, self.cwd, self.engine, self.resumeSessionAt)
-                if (result.loaded) {
-                  resolvedTranscriptDir = result.transcriptDir
-                } else {
-                  effectiveSessionId = undefined
-                }
-              } catch {
-                effectiveSessionId = undefined
-              }
-            } else if (self._sessionId) {
-              const result = await loadAndInjectSessionMessages(self._sessionId, self.cwd, self.engine, self.resumeSessionAt)
+          if (self.continueSession && !self._sessionIdExplicitlyProvided) {
+            const sessions = await listSessions({ dir: self.cwd, limit: 1 })
+            if (sessions.length > 0) {
+              effectiveSessionId = sessions[0].sessionId
+              const result = await loadAndInjectSessionMessages(effectiveSessionId, self.cwd, self.engine, self.resumeSessionAt)
               if (result.loaded) {
                 resolvedTranscriptDir = result.transcriptDir
               } else {
-                // Session file not found — preserve constructor UUID for fresh session
-                effectiveSessionId = self._sessionId
+                effectiveSessionId = undefined
               }
+            } else {
+              // No existing sessions — keep the constructor-created UUID for fresh query
+              effectiveSessionId = self._sessionId
             }
-
-            // Switch session for transcript writes using the resolved transcript dir
-            if (!effectiveSessionId) {
-              regenerateSessionId()
-              effectiveSessionId = getSessionId()
+          } else if (self.shouldFork && self._sessionId) {
+            try {
+              const forkResult = await forkSession(self._sessionId, {
+                dir: self.cwd,
+                ...(self.resumeSessionAt
+                  ? { upToMessageId: self.resumeSessionAt }
+                  : {}),
+              })
+              effectiveSessionId = forkResult.sessionId
+              const result = await loadAndInjectSessionMessages(effectiveSessionId, self.cwd, self.engine)
+              if (result.loaded) {
+                resolvedTranscriptDir = result.transcriptDir
+              } else {
+                effectiveSessionId = undefined
+              }
+            } catch {
+              effectiveSessionId = undefined
             }
-            switchSession(effectiveSessionId as SessionId, resolvedTranscriptDir)
+          } else if (self._sessionId) {
+            const result = await loadAndInjectSessionMessages(self._sessionId, self.cwd, self.engine, self.resumeSessionAt)
+            if (result.loaded) {
+              resolvedTranscriptDir = result.transcriptDir
+            } else {
+              // Session file not found — preserve constructor UUID for fresh session
+              effectiveSessionId = self._sessionId
+            }
+          }
 
-            // Sync resolved sessionId and transcript dir back to authoritative fields
-            self._sessionId = effectiveSessionId
-            sdkContext.sessionId = effectiveSessionId as SessionId
-            sdkContext.sessionProjectDir = resolvedTranscriptDir
+          // Switch session for transcript writes using the resolved transcript dir
+          if (!effectiveSessionId) {
+            regenerateSessionId()
+            effectiveSessionId = getSessionId()
+          }
+          switchSession(effectiveSessionId as SessionId, resolvedTranscriptDir)
 
-            // Submit to engine
-            if (typeof self.prompt === 'string') {
-              for await (const engineMsg of self.engine.submitMessage(self.prompt)) {
+          // Sync resolved sessionId and transcript dir back to authoritative fields
+          self._sessionId = effectiveSessionId
+          sdkContext.sessionId = effectiveSessionId as SessionId
+          sdkContext.sessionProjectDir = resolvedTranscriptDir
+          yield* self.drainAgentFailureQueue()
+
+          // Submit to engine
+          if (typeof self.prompt === 'string') {
+            for await (const engineMsg of self.engine.submitMessage(self.prompt)) {
+              yield engineMsg
+              yield* self.drainTimeoutQueue()
+              yield* self.drainAgentFailureQueue()
+            }
+          } else {
+            for await (const userMessage of self.prompt) {
+              if (self.abortController.signal.aborted) break
+              const content = extractPromptFromUserMessage(userMessage)
+              for await (const engineMsg of self.engine.submitMessage(content, { uuid: userMessage.uuid })) {
                 yield engineMsg
                 yield* self.drainTimeoutQueue()
                 yield* self.drainAgentFailureQueue()
               }
-            } else {
-              for await (const userMessage of self.prompt) {
-                if (self.abortController.signal.aborted) break
-                const content = extractPromptFromUserMessage(userMessage)
-                for await (const engineMsg of self.engine.submitMessage(content, { uuid: userMessage.uuid })) {
-                  yield engineMsg
-                  yield* self.drainTimeoutQueue()
-                  yield* self.drainAgentFailureQueue()
-                }
-              }
             }
-            // Final drain for timeout/failure messages that fired on the last engine yield
-            yield* self.drainTimeoutQueue()
-            yield* self.drainAgentFailureQueue()
+          }
+          // Final drain for timeout/failure messages that fired on the last engine yield
+          yield* self.drainTimeoutQueue()
+          yield* self.drainAgentFailureQueue()
           } finally {
             // Clean up timeout and agent failure queues
             self.timeoutQueue.length = 0
@@ -705,12 +719,12 @@ class QueryImpl implements Query {
               }
               self.envSnapshot = undefined
             }
-            if (hasEnvOverrides) {
+            if (envMutexAcquired) {
               releaseEnvMutex()
             }
           }
-      })()
-    })
+      })(),
+    )
 
     yield* inner
   }
@@ -740,13 +754,14 @@ class QueryImpl implements Query {
       toolPermissionContext: newPermissionContext,
     }))
     // Refresh the engine's tool list to reflect new permissions
-    const updatedTools = getTools(newPermissionContext)
+    const updatedTools = assembleToolPool(newPermissionContext, this.sdkMcpTools)
     this.engine.updateTools(updatedTools)
   }
 
   close(): void {
-    this.interrupt()
-    this.abortController.abort()
+    const wrapperController = this.abortController
+    this.interruptWithSource('sdk_close')
+    requestSdkRootAbort(wrapperController, 'sdk_close', 'sdk_query')
     // Disconnect MCP clients to prevent resource leaks
     const mcpClients = this._engine?.getMcpClients?.() ?? []
     for (const client of mcpClients) {
@@ -762,8 +777,14 @@ class QueryImpl implements Query {
   }
 
   interrupt(): void {
+    this.interruptWithSource('sdk_interrupt')
+  }
+
+  private interruptWithSource(source: string): void {
     if (this._engine) {
-      this._engine.interrupt()
+      this._engine.interrupt(source)
+    } else {
+      requestSdkRootAbort(this.abortController, source, 'sdk_query')
     }
     // Deny all pending permission prompts before clearing
     for (const [toolUseId, pending] of this.pendingPermissionPrompts) {
@@ -803,11 +824,11 @@ class QueryImpl implements Query {
     // Find the last assistant message UUID that has a file-history snapshot
     const fileHistory = state.fileHistory
     for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i]
-      const messageId = (msg as any)?.uuid as string | undefined
+      const msg = messages[i] as { uuid?: string } | undefined
+      const messageId = msg?.uuid
       if (!messageId) continue
 
-      if (fileHistoryCanRestore(fileHistory, messageId as any)) {
+      if (fileHistoryCanRestore(fileHistory, messageId as UUID)) {
         // Synchronous check — return canRewind: true with the messageId.
         // Use rewindFilesAsync() to actually perform the rewind.
         return { canRewind: true }
@@ -829,11 +850,11 @@ class QueryImpl implements Query {
     const fileHistory = state.fileHistory
     let targetMessageId: string | undefined
     for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i]
-      const messageId = (msg as any)?.uuid as string | undefined
+      const msg = messages[i] as { uuid?: string } | undefined
+      const messageId = msg?.uuid
       if (!messageId) continue
 
-      if (fileHistoryCanRestore(fileHistory, messageId as any)) {
+      if (fileHistoryCanRestore(fileHistory, messageId as UUID)) {
         targetMessageId = messageId
         break
       }
@@ -844,7 +865,7 @@ class QueryImpl implements Query {
     }
 
     // Get diff stats before rewinding (async)
-    const diffStats = await fileHistoryGetDiffStats(fileHistory, targetMessageId as any)
+    const diffStats = await fileHistoryGetDiffStats(fileHistory, targetMessageId as UUID)
 
     // Perform the actual rewind
     try {
@@ -853,7 +874,7 @@ class QueryImpl implements Query {
           ...prev,
           fileHistory: updater(prev.fileHistory),
         })),
-        targetMessageId as any,
+        targetMessageId as UUID,
       )
 
       return {
@@ -889,7 +910,7 @@ class QueryImpl implements Query {
   supportedAgents(): string[] {
     const state = this.appStateStore.getState()
     const agents = state.agentDefinitions?.activeAgents
-    return agents?.map((a: any) => a.agentType).filter(Boolean) ?? []
+    return agents?.map((a) => a.agentType).filter(Boolean) ?? []
   }
 
   mcpServerStatus(): McpServerStatus[] {
@@ -904,10 +925,10 @@ class QueryImpl implements Query {
         base.serverInfo = client.serverInfo
       }
       if (client.type === 'failed') {
-        base.error = (client as any).error
+        base.error = client.error
       }
       if ('config' in client) {
-        const cfg = (client as any).config
+        const cfg = client.config
         if (cfg?.scope) base.scope = cfg.scope
       }
       return base
@@ -1155,6 +1176,6 @@ export async function queryAsync(params: {
   prompt: string | AsyncIterable<SDKUserMessage>
   options?: QueryOptions
 }): Promise<Query> {
-  await init()
+  await runOutsideSdkContext(init)
   return query(params)
 }

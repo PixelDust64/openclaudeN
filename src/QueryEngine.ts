@@ -14,6 +14,7 @@ import type {
   SDKStatus,
   SDKUserMessageReplay,
 } from 'src/entrypoints/agentSdkTypes.js'
+import { EXTERNAL_PERMISSION_MODES } from 'src/types/permissions.js'
 import { accumulateUsage, updateUsage } from 'src/services/api/claude.js'
 import type { NonNullableUsage } from 'src/services/api/logging.js'
 import { EMPTY_USAGE } from 'src/services/api/logging.js'
@@ -44,6 +45,14 @@ import { SYNTHETIC_OUTPUT_TOOL_NAME } from './tools/SyntheticOutputTool/Syntheti
 import type { Message } from './types/message.js'
 import type { OrphanedPermission } from './types/textInputTypes.js'
 import { createAbortController } from './utils/abortController.js'
+import {
+  flushInterruptionTrace,
+  getInterruptionSignalAbortEventId,
+  isInterruptionTraceEnabled,
+  registerInterruptionController,
+  requestAbort,
+  traceInterruptionEvent,
+} from './utils/interruptionTrace.js'
 import { validateArrayOf, assertNonEmptyString, assertObject, assertFunction } from './utils/validation.js'
 import { invalidateRemovedToolSchemas } from './utils/toolSchemaCache.js'
 import type { AttributionState } from './utils/commitAttribution.js'
@@ -204,12 +213,66 @@ export class QueryEngine {
     this.config = config
     this.mutableMessages = config.initialMessages ?? []
     this.abortController = config.abortController ?? createAbortController()
+    registerInterruptionController(this.abortController, {
+      subsystem: 'query_engine',
+      controllerRole: 'query-root',
+    })
     this.permissionDenials = []
     this.readFileState = config.readFileCache
     this.totalUsage = EMPTY_USAGE
   }
 
   async *submitMessage(
+    prompt: string | ContentBlockParam[],
+    options?: { uuid?: string; isMeta?: boolean },
+  ): AsyncGenerator<SDKMessage, void, unknown> {
+    const queryId = isInterruptionTraceEnabled() ? randomUUID() : undefined
+    registerInterruptionController(this.abortController, {
+      subsystem: 'query_engine',
+      controllerRole: 'query-root',
+      queryId,
+      querySource: 'sdk',
+    }, { refreshQueryContext: true })
+    const startedEventId = traceInterruptionEvent('query.started', {
+      subsystem: 'query_engine',
+      phase: 'running',
+      queryId,
+      querySource: 'sdk',
+      controllerRole: 'query-root',
+    })
+    let outcome = 'consumer_closed'
+    let terminalError: unknown
+    try {
+      yield* this.submitMessageImpl(prompt, options)
+      outcome = this.abortController.signal.aborted ? 'aborted' : 'completed'
+    } catch (error) {
+      terminalError = error
+      outcome = this.abortController.signal.aborted ? 'aborted' : 'failed'
+      throw error
+    } finally {
+      const terminalOutcome = this.abortController.signal.aborted
+        ? 'aborted'
+        : outcome
+      traceInterruptionEvent('query.terminal', {
+        subsystem: 'query_engine',
+        phase: terminalOutcome,
+        queryId,
+        querySource: 'sdk',
+        controllerRole: 'query-root',
+        outcome: terminalOutcome,
+        reason: this.abortController.signal.reason,
+        error: terminalError,
+        causalEventId: terminalOutcome === 'aborted'
+          ? getInterruptionSignalAbortEventId(this.abortController.signal)
+          : startedEventId,
+      })
+      if (this.abortController.signal.aborted) {
+        flushInterruptionTrace('query_terminal')
+      }
+    }
+  }
+
+  private async *submitMessageImpl(
     prompt: string | ContentBlockParam[],
     options?: { uuid?: string; isMeta?: boolean },
   ): AsyncGenerator<SDKMessage, void, unknown> {
@@ -547,12 +610,18 @@ export class QueryEngine {
     ])
     headlessProfilerCheckpoint('after_skills_plugins')
 
+    const rawPermissionMode = initialAppState.toolPermissionContext.mode
+    const validPermissionMode: PermissionMode = (
+      EXTERNAL_PERMISSION_MODES as readonly string[]
+    ).includes(rawPermissionMode)
+      ? (rawPermissionMode as PermissionMode)
+      : 'default'
+
     yield buildSystemInitMessage({
       tools,
       mcpClients,
       model: mainLoopModel,
-      permissionMode: initialAppState.toolPermissionContext
-        .mode as PermissionMode, // TODO: avoid the cast
+      permissionMode: validPermissionMode,
       commands,
       agents,
       skills,
@@ -939,8 +1008,11 @@ export class QueryEngine {
           )
           if (snipResult !== undefined) {
             if (snipResult.executed) {
-              this.mutableMessages.length = 0
-              this.mutableMessages.push(...snipResult.messages)
+              this.mutableMessages.splice(
+                0,
+                this.mutableMessages.length,
+                ...snipResult.messages,
+              )
               // Persist the snip boundary so a resumed session replays the same
               // removal. recordTranscript is append-only by UUID, so the
               // pre-snip messages already on disk remain; appending this
@@ -948,7 +1020,7 @@ export class QueryEngine {
               // applySnipRemovals prune them in loadTranscriptFile(). Without
               // this, --resume/restart rebuilds the un-snipped history and the
               // context reduction is lost. Mirror the boundary into the local
-              // `messages` recording copy — like the compact_boundary path —
+// `messages` recording copy — like the compact_boundary path —
               // so later writes and the parent chain stay consistent.
               messages.push(message)
               if (persistSession) {
@@ -1202,8 +1274,12 @@ export class QueryEngine {
     }
   }
 
-  interrupt(): void {
-    this.abortController.abort()
+  interrupt(source = 'programmatic_interrupt'): void {
+    requestAbort(this.abortController, undefined, {
+      source,
+      subsystem: 'query_engine',
+      controllerRole: 'query-root',
+    })
   }
 
   getMessages(): readonly Message[] {

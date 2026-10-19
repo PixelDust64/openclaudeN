@@ -15,6 +15,10 @@ const ALLOWED_ENV_FILE_KEYS = new Set([
   'ANTHROPIC_VERTEX_BASE_URL',
   'ANTHROPIC_VERTEX_PROJECT_ID',
   'ATLAS_CLOUD_API_KEY',
+  'APISMART_API_KEY',
+  'APISMART_MODEL',
+  'API_ROUTE_API_KEY',
+  'API_ROUTE_MODEL',
   'AWS_BEARER_TOKEN_BEDROCK',
   'AWS_DEFAULT_REGION',
   'AWS_PROFILE',
@@ -47,9 +51,15 @@ const ALLOWED_ENV_FILE_KEYS = new Set([
   'CODEX_AUTH_JSON_PATH',
   'CODEX_CREDENTIAL_SOURCE',
   'CODEX_HOME',
+  'CONCENTRATE_API_KEY',
+  'CONCENTRATE_BASE_URL',
+  'CONCENTRATE_MODEL',
   'DASHSCOPE_API_KEY',
   'DEEPSEEK_API_KEY',
   'EXA_API_KEY',
+  'EXA_FREE_TIER',
+  'EXA_NUM_RESULTS',
+  'EXA_SEARCH_TYPE',
   'FIRECRAWL_API_KEY',
   'FIRECRAWL_API_URL',
   'FIREWORKS_API_KEY',
@@ -64,6 +74,8 @@ const ALLOWED_ENV_FILE_KEYS = new Set([
   'GITHUB_COPILOT_MAX_SUBAGENTS',
   'GITHUB_COPILOT_OPTIMIZATION_DISABLED',
   'GITHUB_TOKEN',
+  'GMI_API_KEY',
+  'GMI_MODEL',
   'GOOGLE_API_KEY',
   'GOOGLE_CLOUD_PROJECT',
   'GOOGLE_CSE_ID',
@@ -72,6 +84,11 @@ const ALLOWED_ENV_FILE_KEYS = new Set([
   'JINA_API_KEY',
   'KIMI_API_KEY',
   'LINKUP_API_KEY',
+  'LLMTR_API_KEY',
+  'CMD_API_KEY',
+  'COMMANDCODE_API_KEY',
+  'COMMAND_CODE_API_KEY',
+  'LONGCAT_API_KEY',
   'MINIMAX_API_KEY',
   'MINIMAX_BASE_URL',
   'MINIMAX_MODEL',
@@ -88,13 +105,18 @@ const ALLOWED_ENV_FILE_KEYS = new Set([
   'OPENCODE_API_KEY',
   'OPENGATEWAY_API_KEY',
   'OPENGATEWAY_BASE_URL',
+  'OPENCLAUDE_OLLAMA_NUM_CTX',
+  'OLLAMA_API_KEY',
+  'OLLAMA_BASE_URL',
   'OPENROUTER_API_KEY',
   'OPENAI_API_BASE',
   'OPENAI_API_FORMAT',
+  'OPENAI_API_KEYS',
   'OPENAI_API_KEY',
   'OPENAI_AUTH_HEADER',
   'OPENAI_AUTH_HEADER_VALUE',
   'OPENAI_AUTH_SCHEME',
+  'OPENAI_AZURE_STYLE',
   'OPENAI_BASE_URL',
   'OPENAI_MODEL',
   'TAVILY_API_KEY',
@@ -117,6 +139,7 @@ const ALLOWED_ENV_FILE_KEYS = new Set([
   'WEB_QUERY_PARAM',
   'WEB_SEARCH_API',
   'WEB_SEARCH_PROVIDER',
+  'WEB_SEARCH_TIMEOUT_SEC',
   'WEB_URL_TEMPLATE',
   'XAI_API_KEY',
   'XAI_CREDENTIAL_SOURCE',
@@ -164,13 +187,19 @@ function findClosingQuote(value: string, quote: string): number {
 
 /**
  * Unescapes the active quote delimiter in a quoted env value.
+ *
+ * findClosingQuote/isEscapedQuote treat the value as backslash-escaped: an
+ * odd-length backslash run escapes the following quote, so `\\` is already
+ * consumed as a single escaped backslash when locating the closing quote.
+ * Collapse `\\` to `\` here too, otherwise the two stages disagree and a
+ * value like "a\\b" round-trips to the doubled "a\\b" instead of "a\b".
  */
 function unescapeQuotedValue(raw: string, quote: string): string {
   let result = ''
 
   for (let i = 0; i < raw.length; i++) {
-    if (raw[i] === '\\' && raw[i + 1] === quote) {
-      result += quote
+    if (raw[i] === '\\' && (raw[i + 1] === quote || raw[i + 1] === '\\')) {
+      result += raw[i + 1]
       i++
       continue
     }

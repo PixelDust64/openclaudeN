@@ -1,4 +1,5 @@
 import { resolve } from 'node:path'
+import { hasPrintFlag } from './printFlag.js'
 import '../integrations/index.js'
 import {
   ensureIntegrationsLoaded,
@@ -11,10 +12,18 @@ import type {
   VendorDescriptor,
 } from '../integrations/descriptors.js'
 import {
+  getMiniMaxBaseUrlOverride,
+  getMiniMaxBaseUrlValidationError,
   getRouteCredentialEnvVars,
   getRouteCredentialValue,
   getRouteDescriptor,
   getRouteDefaultModel,
+  isCanonicalApiRouteInferenceBaseUrl,
+  isCanonicalApismartInferenceBaseUrl,
+  isCanonicalConcentrateInferenceBaseUrl,
+  isCanonicalCommandcodeInferenceBaseUrl,
+  isCloudflareBaseUrl,
+  isLongcatBaseUrl,
   matchHostnameAgainstRouteHosts,
   resolveActiveRouteIdFromEnv,
   resolveRouteIdFromBaseUrl,
@@ -27,19 +36,24 @@ import {
   resolveProviderRequest,
   shouldUseCodexTransport,
 } from '../services/api/providerConfig.js'
+import { hasUsableOpenAICredential } from '../services/api/credentialPool.js'
 import { getGlobalClaudeFile } from './env.js'
 import { isBareMode } from './envUtils.js'
 import {
   type GeminiResolvedCredential,
   resolveGeminiCredential,
 } from './geminiAuth.js'
+import { getCommandcodeChatCompletionsModelError } from '../integrations/gateways/commandcode.js'
 import { readXaiCredentialsAsync } from './xaiCredentials.js'
 
 async function defaultHasStoredXaiOAuthCredentials(): Promise<boolean> {
   const stored = await readXaiCredentialsAsync()
   return Boolean(stored?.accessToken && stored?.refreshToken)
 }
-import { PROFILE_FILE_NAME } from './providerProfile.js'
+import {
+  PROFILE_FILE_NAME,
+  resolveOpenAICredentialEnvState,
+} from './providerProfile.js'
 import {
   redactSecretValueForDisplay,
   type SecretValueSource,
@@ -106,7 +120,7 @@ function getOpenAIMissingKeyMessage(): string {
   const profilePath = resolve(process.cwd(), PROFILE_FILE_NAME)
 
   return [
-    'OPENAI_API_KEY is required when CLAUDE_CODE_USE_OPENAI=1 and OPENAI_BASE_URL is not local.',
+    'OPENAI_API_KEYS or OPENAI_API_KEY is required when CLAUDE_CODE_USE_OPENAI=1 and OPENAI_BASE_URL is not local.',
     `To recover, run /provider and switch provider, or set CLAUDE_CODE_USE_OPENAI=0 in your shell environment.`,
     `Saved startup settings can come from ${globalConfigPath} or ${profilePath}.`,
   ].join('\n')
@@ -117,6 +131,40 @@ function hasNonEmptyEnvValue(
   envVar: string,
 ): boolean {
   return typeof env[envVar] === 'string' && env[envVar]!.trim() !== ''
+}
+
+function hasUsableCredentialEnvValue(
+  env: NodeJS.ProcessEnv,
+  envVar: string,
+): boolean {
+  const value = env[envVar]
+  if (typeof value !== 'string') {
+    return false
+  }
+
+  if (
+    envVar === 'OPENAI_API_KEYS' ||
+    envVar === 'OPENAI_API_KEY' ||
+    envVar === 'AIMLAPI_API_KEY' ||
+    envVar === 'APISMART_API_KEY' ||
+    envVar === 'API_ROUTE_API_KEY' ||
+    envVar === 'CONCENTRATE_API_KEY' ||
+    envVar === 'LLMTR_API_KEY' ||
+    envVar === 'CMD_API_KEY' ||
+    envVar === 'COMMANDCODE_API_KEY' ||
+    envVar === 'COMMAND_CODE_API_KEY'
+  ) {
+    return hasUsableOpenAICredential(value)
+  }
+
+  return value.trim() !== ''
+}
+
+function hasOpenAICredential(env: NodeJS.ProcessEnv): boolean {
+  return (
+    hasUsableCredentialEnvValue(env, 'OPENAI_API_KEYS') ||
+    hasUsableCredentialEnvValue(env, 'OPENAI_API_KEY')
+  )
 }
 
 function normalizeBaseUrl(baseUrl: string | undefined): string | undefined {
@@ -226,19 +274,48 @@ function getRuntimeValidationTarget(
     return enabledTarget
   }
 
+  // The documented CONCENTRATE_API_KEY-only and API_ROUTE_API_KEY-only setup
+  // is routed before the client applies its default base URL. Select its descriptor
+  // directly so startup validates the dedicated credential, including a noncanonical
+  // dedicated base URL, instead of returning early for an unset OpenAI mode.
+  const activeRouteId = resolveActiveRouteIdFromEnv(env)
+  if (activeRouteId === 'concentrate' || activeRouteId === 'api-route') {
+    return validationTargets.find(target => target.descriptor.id === activeRouteId)
+  }
+
   if (!useOpenAI) {
     return undefined
   }
 
   const request = resolveProviderRequest({
     model: env.OPENAI_MODEL,
-    baseUrl: env.OPENAI_BASE_URL,
+    baseUrl: env.OPENAI_BASE_URL?.trim() || env.OPENAI_API_BASE?.trim(),
     fallbackModel: getRouteDefaultModel('openai'),
   })
 
   const baseUrlMatchedTarget = validationTargets.find(target => {
     const routing = getValidationRouting(target)
     if (!routing?.matchDefaultBaseUrl && !routing?.matchBaseUrlHosts?.length) {
+      return false
+    }
+
+    // Some routes have stricter endpoint boundaries than a host match. Keep
+    // validation aligned with the runtime resolver so a custom endpoint on a
+    // shared host is not forced through a dedicated-credential contract.
+    if (
+      ((target.descriptor.id === 'cloudflare' &&
+        !isCloudflareBaseUrl(request.baseUrl)) ||
+        (target.descriptor.id === 'longcat' &&
+          !isLongcatBaseUrl(request.baseUrl)) ||
+        (target.descriptor.id === 'apismart' &&
+          !isCanonicalApismartInferenceBaseUrl(request.baseUrl)) ||
+        (target.descriptor.id === 'concentrate' &&
+          !isCanonicalConcentrateInferenceBaseUrl(request.baseUrl)) ||
+        (target.descriptor.id === 'api-route' &&
+          !isCanonicalApiRouteInferenceBaseUrl(request.baseUrl)) ||
+        (target.descriptor.id === 'commandcode' &&
+          !isCanonicalCommandcodeInferenceBaseUrl(request.baseUrl)))
+    ) {
       return false
     }
 
@@ -274,8 +351,44 @@ function getCredentialEnvValidationError(
   env: NodeJS.ProcessEnv,
   request?: ReturnType<typeof resolveProviderRequest>,
 ): string | null {
+  const credentialEnvVars = validation.credentialEnvVars
+  const usesOpenAIFallback =
+    credentialEnvVars.includes('OPENAI_API_KEYS') ||
+    credentialEnvVars.includes('OPENAI_API_KEY')
+
+  if (usesOpenAIFallback) {
+    const openAIState = resolveOpenAICredentialEnvState(env)
+    if (openAIState.invalid) {
+      const hasUsableDedicatedCredential = credentialEnvVars.some(
+        envVar =>
+          envVar !== 'OPENAI_API_KEYS' &&
+          envVar !== 'OPENAI_API_KEY' &&
+          hasUsableCredentialEnvValue(env, envVar),
+      )
+      if (!hasUsableDedicatedCredential) {
+        return (
+          validation.invalidCredentialValues?.find(
+            invalidValue => invalidValue.envVar === openAIState.envVar,
+          )?.message ??
+          validation.missingCredentialMessage ??
+          null
+        )
+      }
+    }
+  }
+
   for (const invalidValue of validation.invalidCredentialValues ?? []) {
-    if (env[invalidValue.envVar]?.trim() === invalidValue.value) {
+    if (
+      usesOpenAIFallback &&
+      (invalidValue.envVar === 'OPENAI_API_KEYS' ||
+        invalidValue.envVar === 'OPENAI_API_KEY')
+    ) {
+      continue
+    }
+
+    const envValue = env[invalidValue.envVar]
+    const envValues = (envValue ?? '').split(',').map(value => value.trim())
+    if (envValues.includes(invalidValue.value)) {
       return invalidValue.message
     }
   }
@@ -290,7 +403,7 @@ function getCredentialEnvValidationError(
   }
 
   if (
-    validation.credentialEnvVars.some(envVar => hasNonEmptyEnvValue(env, envVar))
+    credentialEnvVars.some(envVar => hasUsableCredentialEnvValue(env, envVar))
   ) {
     return null
   }
@@ -312,6 +425,32 @@ async function getDescriptorValidationError(
   const validation = target.descriptor.validation
   if (!validation) {
     return null
+  }
+
+  // An explicit Concentrate credential carries the dedicated contract. A
+  // same-host proxy with only generic OpenAI variables is not selected as this
+  // route, but once Concentrate is selected its base must be canonical.
+  const concentrateBaseUrl =
+    env.CONCENTRATE_BASE_URL?.trim() ||
+    env.OPENAI_BASE_URL?.trim() ||
+    env.OPENAI_API_BASE?.trim()
+  if (
+    target.descriptor.id === 'concentrate' &&
+    concentrateBaseUrl &&
+    !isCanonicalConcentrateInferenceBaseUrl(concentrateBaseUrl)
+  ) {
+    return 'Concentrate credentials require the canonical https://api.concentrate.ai/v1 endpoint.'
+  }
+
+  const apiRouteBaseUrl =
+    env.OPENAI_BASE_URL?.trim() ||
+    env.OPENAI_API_BASE?.trim()
+  if (
+    target.descriptor.id === 'api-route' &&
+    apiRouteBaseUrl &&
+    !isCanonicalApiRouteInferenceBaseUrl(apiRouteBaseUrl)
+  ) {
+    return 'API Route credentials require the canonical https://global.api-route.com/v1 endpoint.'
   }
 
   switch (validation.kind) {
@@ -457,6 +596,14 @@ export async function getProviderValidationError(
   const useOpenAI = isEnvTruthy(env.CLAUDE_CODE_USE_OPENAI)
   const validationTarget = getRuntimeValidationTarget(env)
 
+  if (resolveActiveRouteIdFromEnv(env) === 'minimax') {
+    const baseUrl = useOpenAI
+      ? env.OPENAI_BASE_URL?.trim() || env.OPENAI_API_BASE?.trim()
+      : getMiniMaxBaseUrlOverride(env)
+    const validationError = getMiniMaxBaseUrlValidationError(baseUrl)
+    if (validationError) return validationError
+  }
+
   if (!useOpenAI && !validationTarget) {
     return null
   }
@@ -500,6 +647,12 @@ export async function getProviderValidationError(
   }
 
   const activeRouteId = resolveActiveRouteIdFromEnv(env)
+  if (activeRouteId === 'commandcode') {
+    const modelError = getCommandcodeChatCompletionsModelError(
+      request.resolvedModel,
+    )
+    if (modelError) return modelError
+  }
   const shouldPreferGenericRouteValidation =
     validationTarget?.kind === 'vendor' &&
     validationTarget.descriptor.id === 'openai' &&
@@ -521,9 +674,11 @@ export async function getProviderValidationError(
 
       if (descriptorValidationError) {
         if (
+          descriptorValidationError ===
+            validationTarget.descriptor.validation?.missingCredentialMessage &&
           validationTarget.kind === 'vendor' &&
           validationTarget.descriptor.id === 'openai' &&
-          !env.OPENAI_API_KEY &&
+          !hasOpenAICredential(env) &&
           !isLocalProviderUrl(request.baseUrl) &&
           !isLikelyOllamaEndpoint(request.baseUrl)
         ) {
@@ -542,7 +697,7 @@ export async function getProviderValidationError(
   }
 
   if (
-    !env.OPENAI_API_KEY &&
+    !hasOpenAICredential(env) &&
     !isLocalProviderUrl(request.baseUrl) &&
     !isLikelyOllamaEndpoint(request.baseUrl)
   ) {
@@ -587,8 +742,7 @@ export function shouldExitForStartupProviderValidationError(options: {
   }
 
   return (
-    args.includes('-p') ||
-    args.includes('--print') ||
+    hasPrintFlag(args) ||
     args.includes('--init-only') ||
     args.some(arg => arg.startsWith('--sdk-url'))
   )

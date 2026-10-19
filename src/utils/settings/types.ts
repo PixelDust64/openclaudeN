@@ -1,5 +1,5 @@
 import { feature } from 'bun:bundle'
-import { z } from 'zod/v4'
+import { toJSONSchema, z } from 'zod/v4'
 import { SandboxSettingsSchema } from '../../entrypoints/sandboxTypes.js'
 import { isEnvTruthy } from '../envUtils.js'
 import { lazySchema } from '../lazySchema.js'
@@ -29,6 +29,103 @@ export {
 import { type HookCommand, HooksSchema } from '../../schemas/hooks.js'
 import { AutoFixConfigSchema } from '../../services/autoFix/autoFixConfig.js'
 import { count } from '../array.js'
+
+export const MAX_MODEL_PRICING_ENTRIES = 256
+export const MAX_MODEL_PRICING_ID_LENGTH = 512
+export const MAX_MODEL_TOKEN_RATE_USD_PER_MILLION = 100_000
+export const MAX_MODEL_WEB_SEARCH_RATE_USD_PER_REQUEST = 1_000
+
+const ModelTokenRateSchema = z
+  .number()
+  .finite()
+  .nonnegative()
+  .max(MAX_MODEL_TOKEN_RATE_USD_PER_MILLION)
+
+export const ModelPricingEntrySchema = z
+  .object({
+    inputTokens: ModelTokenRateSchema.describe(
+      'Input-token price in USD per 1,000,000 tokens.',
+    ),
+    outputTokens: ModelTokenRateSchema.describe(
+      'Output-token price in USD per 1,000,000 tokens.',
+    ),
+    promptCacheReadTokens: ModelTokenRateSchema.describe(
+      'Prompt-cache read price in USD per 1,000,000 tokens.',
+    ),
+    promptCacheWriteTokens: ModelTokenRateSchema.describe(
+      'Prompt-cache write price in USD per 1,000,000 tokens.',
+    ),
+    webSearchRequests: z
+      .number()
+      .finite()
+      .nonnegative()
+      .max(MAX_MODEL_WEB_SEARCH_RATE_USD_PER_REQUEST)
+      .optional()
+      .describe(
+        'Web-search price in USD per request. Defaults to $0.01 when omitted.',
+      ),
+  })
+  .strict()
+
+const MODEL_PRICING_KEY_PREFIX = '\0'
+
+const ModelPricingJSONSchema = z.record(
+  z.string().min(1).max(MAX_MODEL_PRICING_ID_LENGTH),
+  ModelPricingEntrySchema,
+)
+
+const ModelPricingSchema = z.preprocess(
+  value => {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return value
+    }
+    // Zod's record parser treats Object.prototype names as structural record
+    // members. Prefix every raw own key before validation so arbitrary exact
+    // model ids such as `constructor`, `toString`, and `__proto__` stay data.
+    const entries = Object.entries(value)
+    if (
+      entries.length > MAX_MODEL_PRICING_ENTRIES ||
+      entries.some(
+        ([model]) =>
+          model.length < 1 || model.length > MAX_MODEL_PRICING_ID_LENGTH,
+      )
+    ) {
+      return null
+    }
+    const encoded: Record<string, unknown> = Object.create(null) as Record<
+      string,
+      unknown
+    >
+    for (const [model, entry] of entries) {
+      encoded[MODEL_PRICING_KEY_PREFIX + model] = entry
+    }
+    return encoded
+  },
+  z
+    .record(z.string(), ModelPricingEntrySchema)
+    .transform(value => {
+      const decoded = Object.create(null) as Record<
+        string,
+        z.infer<typeof ModelPricingEntrySchema>
+      >
+      for (const [encodedModel, entry] of Object.entries(value)) {
+        decoded[encodedModel.slice(MODEL_PRICING_KEY_PREFIX.length)] = entry
+      }
+      return decoded
+    }),
+)
+
+export const ModelPricingDiagnosticSchema = z.unknown().superRefine(
+  (value, context) => {
+    if (!ModelPricingSchema.safeParse(value).success) {
+      context.addIssue({
+        code: 'custom',
+        message: 'Invalid modelPricing value was ignored',
+        params: { received: value },
+      })
+    }
+  },
+)
 
 /**
  * Schema for environment variables
@@ -114,6 +211,19 @@ export const ExtraKnownMarketplaceSchema = lazySchema(() =>
       ),
   }),
 )
+
+// The prefix transform above is deliberately invisible to settings authors,
+// so expose the equivalent public input contract to JSON Schema consumers.
+// Zod documents this hook for schemas whose runtime representation needs a
+// custom JSON Schema (the preprocess itself is otherwise unrepresentable).
+ModelPricingSchema._zod.toJSONSchema = () => {
+  const schema = toJSONSchema(ModelPricingJSONSchema, {
+    unrepresentable: 'any',
+  }) as Record<string, unknown>
+  delete schema.$schema
+  schema.maxProperties = MAX_MODEL_PRICING_ENTRIES
+  return schema
+}
 
 /**
  * Schema for allowed MCP server entry in enterprise allowlist.
@@ -266,6 +376,12 @@ export const SettingsSchema = lazySchema(() =>
         .literal(CLAUDE_CODE_SETTINGS_SCHEMA_URL)
         .optional()
         .describe('JSON Schema reference for Claude Code settings'),
+      subscriptionType: z
+        .enum(['free', 'pro', 'max', 'team', 'enterprise'])
+        .optional()
+        .describe(
+          'Override the active subscription type from user settings only. Project, repository, local, flag, and policy settings are ignored to prevent spoofing. Allowed values: free, pro, max, team, enterprise. The "free" value is authoritative and takes precedence over OAuth fallback detection.',
+        ),
       apiKeyHelper: z
         .string()
         .optional()
@@ -335,7 +451,7 @@ export const SettingsSchema = lazySchema(() =>
         .int()
         .optional()
         .describe(
-          'Number of days to retain chat transcripts (default: 30). Setting to 0 disables session persistence entirely: no transcripts are written and existing transcripts are deleted at startup.',
+          'Number of days to retain local session artifacts, including chat transcripts and completed background-session metadata and logs (default: 30). Setting to 0 disables transcript persistence entirely and removes completed background-session artifacts after they finish.',
         ),
       env: EnvironmentVariablesSchema()
         .optional()
@@ -375,6 +491,18 @@ export const SettingsSchema = lazySchema(() =>
         .optional()
         .describe(
           "Include built-in commit and PR workflow instructions in Claude's system prompt (default: true)",
+        ),
+      agentsSkillsEnabled: z
+        .boolean()
+        .optional()
+        .describe(
+          'Load skills read-only from the shared ~/.agents/skills directory, after all OpenClaude skills (default: true). Ignored in project settings.',
+        ),
+      claudeCodeSkillsEnabled: z
+        .boolean()
+        .optional()
+        .describe(
+          'Load skills read-only from Claude Code\'s ~/.claude/skills directory, after all OpenClaude skills (default: false). Ignored in project settings.',
         ),
       permissions: PermissionsSchema()
         .optional()
@@ -459,7 +587,16 @@ export const SettingsSchema = lazySchema(() =>
           'and feed errors back for self-repair.',
         ),
       worktree: z
-        .object({
+        .preprocess((val: unknown) => {
+          if (val && typeof val === 'object') {
+            const copy: Record<string, unknown> = { ...(val as Record<string, unknown>) }
+            if ('enableGitLongPaths' in val && !('autoConfigureLongPaths' in val)) {
+              copy.autoConfigureLongPaths = (val as Record<string, unknown>).enableGitLongPaths
+            }
+            return copy
+          }
+          return val
+        }, z.object({
           symlinkDirectories: z
             .array(z.string())
             .optional()
@@ -475,7 +612,18 @@ export const SettingsSchema = lazySchema(() =>
               'Directories to include when creating worktrees, via git sparse-checkout (cone mode). ' +
                 'Dramatically faster in large monorepos — only the listed paths are written to disk.',
             ),
-        })
+          autoConfigureLongPaths: z
+            .boolean()
+            .optional()
+            .describe(
+              'On Windows, enable Git long-path support (core.longpaths=true) before ' +
+                'creating worktrees. Defaults to true when unset.',
+            ),
+          enableGitLongPaths: z
+            .boolean()
+            .optional()
+            .describe('Deprecated alias for autoConfigureLongPaths.'),
+        }))
         .optional()
         .describe('Git worktree configuration for --worktree flag.'),
       // Whether to disable all hooks and statusLine
@@ -780,6 +928,32 @@ export const SettingsSchema = lazySchema(() =>
             'Use "default" key as fallback. Model name must exist in agentModels. ' +
             'Example: { "Explore": "deepseek-chat", "general-purpose": "gpt-4o", "default": "gpt-4o" }',
         ),
+      smartRouting: z
+        .object({
+          enabled: z.boolean().optional().describe('Opt in to per-turn simple-vs-strong model routing. Off by default.'),
+          simpleModel: z
+            .string()
+            .optional()
+            .describe('agentModels key (or bare model id) used for turns classified "simple".'),
+          strongModel: z
+            .string()
+            .optional()
+            .describe('agentModels key (or bare model id) used for "strong" turns and whenever routing is unsure.'),
+          simpleMaxChars: z
+            .number()
+            .optional()
+            .describe('Max characters in user input to qualify as "simple". Passed to routeModel.'),
+          simpleMaxWords: z
+            .number()
+            .optional()
+            .describe('Max whitespace-separated words to qualify as "simple". Passed to routeModel.'),
+        })
+        .optional()
+        .describe(
+          'Opt-in smart routing: classify each user turn and route simple turns to the configured simple model. ' +
+            'simpleModel/strongModel are agentModels keys (or bare model ids). ' +
+            'Example: { "enabled": true, "simpleModel": "mini", "strongModel": "main" }',
+        ),
       providerFallbackChain: z
         .array(z.string())
         .optional()
@@ -788,6 +962,43 @@ export const SettingsSchema = lazySchema(() =>
             'or quota error, OpenClaude advances to the next profile in this list (starting after ' +
             'the currently-active id) and retries the turn. ' +
             'Example: ["provider_anthropic", "provider_openai", "provider_ollama"]',
+        ),
+      modelLimits: z
+        .record(
+          z.string(),
+          z.object({
+            contextWindow: z
+              .number()
+              .int()
+              .positive()
+              .optional()
+              .describe('Total context window size in tokens.'),
+            maxOutputTokens: z
+              .number()
+              .int()
+              .positive()
+              .optional()
+              .describe('Maximum output tokens per response.'),
+          }),
+        )
+        .optional()
+        .describe(
+          'Per-model overrides for context window and max output tokens. ' +
+            'Used for OpenAI-compatible models whose limits are not in the built-in catalog. ' +
+            'Keys are matched against the model name (exact match preferred, then prefix). ' +
+            'CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS / CLAUDE_CODE_OPENAI_MAX_OUTPUT_TOKENS env vars take precedence. ' +
+            'Example: { "qwen3.6-plus": { "contextWindow": 1048576, "maxOutputTokens": 32768 } }',
+        ),
+      modelPricing: ModelPricingSchema.optional()
+        // One malformed pricing map must not invalidate unrelated settings in
+        // the same source. Drop the whole field so callers never combine a
+        // partially-trusted price with built-in cache rates.
+        .catch(undefined)
+        .describe(
+          'Exact-model pricing overrides. Token fields are USD per 1,000,000 tokens; ' +
+            'webSearchRequests is USD per request and defaults to $0.01 when omitted. ' +
+            'All four token fields are required. Keys are exact, case-sensitive resolved model ids. ' +
+            'Shared project settings are ignored for personal USD accounting.',
         ),
       fastMode: z
         .boolean()
@@ -1025,10 +1236,41 @@ export const SettingsSchema = lazySchema(() =>
             .describe(
               'When false, disables auto-memory reads and writes for this project. Discoverable alias for `autoMemoryEnabled`; the two are equivalent and either one can be used to opt out for governance / regulated / client-sensitive repos (issue #1326). When both are set, the more restrictive (false) value wins so a parent-scope opt-out cannot be silently re-enabled by a narrower scope.',
             ),
+          requireApprovalBeforeWrite: z
+            .boolean()
+            .optional()
+            .describe(
+              'Persistent auto-memory writes require explicit permission approval by default. Set to false to restore automatic memory writes when auto-memory is enabled.',
+            ),
         })
         .optional()
         .describe(
-          'Memory governance settings. Currently exposes `autoWrite` as the discoverable shape requested in #1326; further opt-in fields (e.g. approval gates) may be added under this namespace without taking a new top-level key each time.',
+          'Memory governance settings. `autoWrite` controls whether auto-memory is active; `requireApprovalBeforeWrite` forces explicit approval for persistent memory writes.',
+        ),
+      git: z
+        .object({
+          addAICoAuthor: z
+            .boolean()
+            .optional()
+            .describe(
+              'When true, opt in to the generated Co-Authored-By trailer for local commits. When false in any settings source, generated commit attribution is blocked.',
+            ),
+          addGeneratedWithFooter: z
+            .boolean()
+            .optional()
+            .describe(
+              'When true, opt in to the generated OpenClaude footer for PR descriptions. When false in any settings source, generated PR attribution is blocked.',
+            ),
+          forbiddenCommitMessagePatterns: z
+            .array(z.string())
+            .optional()
+            .describe(
+              'Literal text patterns that must not appear in git commit messages, such as "Co-Authored-By:" or "Generated with".',
+            ),
+        })
+        .optional()
+        .describe(
+          'Git governance settings for AI attribution and commit-message policy.',
         ),
       autoMemoryDirectory: z
         .string()
@@ -1197,6 +1439,7 @@ export type DeniedMcpServerEntry = z.infer<
   ReturnType<typeof DeniedMcpServerEntrySchema>
 >
 export type SettingsJson = z.infer<ReturnType<typeof SettingsSchema>>
+export type ModelPricingEntry = z.infer<typeof ModelPricingEntrySchema>
 
 /**
  * Type guard for MCP server entry with serverName

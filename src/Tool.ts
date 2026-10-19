@@ -42,6 +42,7 @@ import type {
   SystemMessage,
   UserMessage,
 } from './types/message.js'
+import type { SessionId } from './types/ids.js'
 // Import permission types from centralized location to break import cycles
 // Import PermissionResult from centralized location to break import cycles
 import type {
@@ -64,6 +65,7 @@ import type { FileStateCache } from './utils/fileStateCache.js'
 import type { DenialTrackingState } from './utils/permissions/denialTracking.js'
 import type { SystemPrompt } from './utils/systemPromptType.js'
 import type { ContentReplacementState } from './utils/toolResultStorage.js'
+import type { QueryLifecycleOperationTracker } from './utils/queryLifecycle.js'
 
 // Re-export progress types for backwards compatibility
 export type {
@@ -99,6 +101,12 @@ export type QueryChainTracking = {
 export type QueryActivity = {
   registerActivity(reason: string): void
   acquireLease(input: QueryGuardLeaseInput): QueryGuardLease
+  /**
+   * Suspend query idle/hard-max accounting while blocked on a human decision.
+   * Lease deadlines continue to run. Returns a resume function to call exactly
+   * once when the interaction ends.
+   */
+  beginUserInteraction?(): () => void
 }
 
 export type ValidationResult =
@@ -176,6 +184,10 @@ export type ToolUseContext = {
     mcpClients: MCPServerConnection[]
     mcpResources: Record<string, ServerResource[]>
     isNonInteractiveSession: boolean
+    /** Whether unresolved agent permission requests can reach a parent prompt. */
+    canShowPermissionPrompts?: boolean
+    /** Session that owns interactive permission prompts for this context. */
+    permissionSessionId?: SessionId
     agentDefinitions: AgentDefinitionsResult
     maxBudgetUsd?: number
     /** Custom system prompt that replaces the default system prompt */
@@ -192,6 +204,8 @@ export type ToolUseContext = {
   abortController: AbortController
   readFileState: FileStateCache
   getAppState(): AppState
+  /** Returns untransformed root state when this context belongs to an agent. */
+  getRootAppState?(): AppState
   setAppState(f: (prev: AppState) => AppState): void
   /**
    * Always-shared setAppState for session-scoped infrastructure (background
@@ -291,6 +305,7 @@ export type ToolUseContext = {
     toolInputSummary?: string | null,
   ) => (request: PromptRequest) => Promise<PromptResponse>
   toolUseId?: string
+  queryLifecycle?: QueryLifecycleOperationTracker
   criticalSystemReminder_EXPERIMENTAL?: string
   /** When true, preserve toolUseResult on messages even for subagents.
    * Used by in-process teammates whose transcripts are viewable by the user. */

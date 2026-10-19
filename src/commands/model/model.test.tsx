@@ -1,6 +1,6 @@
 import { PassThrough } from 'node:stream'
 
-import { afterEach, beforeEach, expect, mock, test } from 'bun:test'
+import { afterEach, beforeEach, expect, mock, setSystemTime, test } from 'bun:test'
 import React from 'react'
 
 import { getAdditionalModelOptionsCacheScope } from '../../services/api/providerConfig.js'
@@ -12,9 +12,30 @@ import {
   resetSettingsCache,
   setSessionSettingsCache,
 } from '../../utils/settings/settingsCache.js'
+import { encodeSwitchProfileValue } from '../../utils/model/modelOptions.js'
 import type { ModelOption } from '../../utils/model/modelOptions.js'
 import type { ModelSetting } from '../../utils/model/model.js'
 import type { SettingsJson } from '../../utils/settings/types.js'
+import type { ModelCatalogEntry } from '../../integrations/descriptors.js'
+import {
+  filterAvailableCatalogEntries,
+  getRouteDescriptor,
+} from '../../integrations/index.js'
+import { mergeRouteCatalogEntries } from '../../utils/model/routeCatalogOptions.js'
+import * as actualFastModeForModelTest from '../../utils/fastMode.js'
+import * as actualExtraUsageForModelTest from '../../utils/extraUsage.js'
+import * as actualDiscoveryServiceForModelTest from '../../integrations/discoveryService.js'
+import * as actualDiscoveryCacheForModelTest from '../../integrations/discoveryCache.js'
+
+const REAL_DISCOVERY_SERVICE_FOR_MODEL_TEST = { ...actualDiscoveryServiceForModelTest }
+const REAL_DISCOVERY_CACHE_FOR_MODEL_TEST = { ...actualDiscoveryCacheForModelTest }
+
+// Snapshot the real fast-mode module up front so the cross-profile switch test
+// can mock it with a full surface and restore the real one afterwards.
+const REAL_FAST_MODE_FOR_MODEL_TEST = { ...actualFastModeForModelTest }
+// Same for extraUsage, so the cross-profile confirmation test can force the
+// `Billed as extra usage` branch and restore the real surface afterwards.
+const REAL_EXTRA_USAGE_FOR_MODEL_TEST = { ...actualExtraUsageForModelTest }
 
 type SettingsModule = typeof import('../../utils/settings/settings.js')
 
@@ -29,9 +50,17 @@ const originalEnv = {
   OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
   OPENAI_API_BASE: process.env.OPENAI_API_BASE,
   OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+  OPENAI_API_KEYS: process.env.OPENAI_API_KEYS,
+  OPENAI_AUTH_HEADER: process.env.OPENAI_AUTH_HEADER,
+  OPENAI_AUTH_HEADER_VALUE: process.env.OPENAI_AUTH_HEADER_VALUE,
+  OPENAI_AUTH_SCHEME: process.env.OPENAI_AUTH_SCHEME,
   OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
   OPENAI_MODEL: process.env.OPENAI_MODEL,
+  CMD_API_KEY: process.env.CMD_API_KEY,
+  COMMANDCODE_API_KEY: process.env.COMMANDCODE_API_KEY,
+  COMMAND_CODE_API_KEY: process.env.COMMAND_CODE_API_KEY,
   ANTHROPIC_CUSTOM_HEADERS: process.env.ANTHROPIC_CUSTOM_HEADERS,
+  CLAUDE_CODE_EFFORT_LEVEL: process.env.CLAUDE_CODE_EFFORT_LEVEL,
   CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED:
     process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED,
   CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID:
@@ -209,9 +238,17 @@ afterEach(() => {
     restoreEnv('OPENAI_BASE_URL', originalEnv.OPENAI_BASE_URL)
     restoreEnv('OPENAI_API_BASE', originalEnv.OPENAI_API_BASE)
     restoreEnv('OPENAI_API_KEY', originalEnv.OPENAI_API_KEY)
+    restoreEnv('OPENAI_API_KEYS', originalEnv.OPENAI_API_KEYS)
+    restoreEnv('OPENAI_AUTH_HEADER', originalEnv.OPENAI_AUTH_HEADER)
+    restoreEnv('OPENAI_AUTH_HEADER_VALUE', originalEnv.OPENAI_AUTH_HEADER_VALUE)
+    restoreEnv('OPENAI_AUTH_SCHEME', originalEnv.OPENAI_AUTH_SCHEME)
     restoreEnv('OPENROUTER_API_KEY', originalEnv.OPENROUTER_API_KEY)
     restoreEnv('OPENAI_MODEL', originalEnv.OPENAI_MODEL)
+    restoreEnv('CMD_API_KEY', originalEnv.CMD_API_KEY)
+    restoreEnv('COMMANDCODE_API_KEY', originalEnv.COMMANDCODE_API_KEY)
+    restoreEnv('COMMAND_CODE_API_KEY', originalEnv.COMMAND_CODE_API_KEY)
     restoreEnv('ANTHROPIC_CUSTOM_HEADERS', originalEnv.ANTHROPIC_CUSTOM_HEADERS)
+    restoreEnv('CLAUDE_CODE_EFFORT_LEVEL', originalEnv.CLAUDE_CODE_EFFORT_LEVEL)
     restoreEnv(
       'CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED',
       originalEnv.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED,
@@ -259,13 +296,14 @@ type DiscoveryModelForTest = {
 }
 
 function mockDescriptorDiscovery(options: {
-  cachedModels: DiscoveryModelForTest[]
+  cachedModels: DiscoveryModelForTest[] | null
+  error?: string
   discoveredModels?: DiscoveryModelForTest[]
   routeId?: string
 }): void {
   mock.module('../../integrations/discoveryCache.js', () => ({
     clearDiscoveryCache: mock(async () => {}),
-    getCachedModels: mock(async () => ({
+    getCachedModels: mock(async () => options.cachedModels === null ? null : ({
       models: options.cachedModels,
       updatedAt: Date.now(),
       error: null,
@@ -283,13 +321,21 @@ function mockDescriptorDiscovery(options: {
         headers?: Record<string, string>
       },
     ) => `${routeId}|${requestOptions?.baseUrl ?? ''}|${requestOptions?.apiKey ?? ''}|${JSON.stringify(requestOptions?.headers ?? {})}`,
-    discoverModelsForRoute: mock(async () => ({
-      routeId: options.routeId ?? 'openrouter',
-      models: options.discoveredModels ?? options.cachedModels,
-      stale: false,
-      error: null,
-      source: 'network',
-    })),
+    discoverModelsForRoute: mock(async () => {
+      const routeId = options.routeId ?? 'openrouter'
+      const rawStatic = getRouteDescriptor(routeId)?.catalog?.models ?? []
+      const discovered = (options.discoveredModels ?? options.cachedModels ?? []) as ModelCatalogEntry[]
+      const merged = filterAvailableCatalogEntries(
+        mergeRouteCatalogEntries(rawStatic, discovered),
+      )
+      return {
+        routeId,
+        models: merged,
+        stale: false,
+        error: options.error ? { message: options.error, recordedAt: Date.now() } : null,
+        source: options.error ? 'error' : 'network',
+      }
+    }),
     probeRouteReadiness: mock(async () => null),
   }))
 }
@@ -409,6 +455,199 @@ test('opens the model picker without awaiting local model discovery refresh', as
   // Use a fresh module instance so per-test mocks stay local to this test.
   const { call } = await importFreshModelModule('local-discovery')
   await expectModelCommandDoesNotWaitForRefresh(call(() => {}, {} as never, ''))
+})
+
+test('/model current reports the effective effort when env overrides session ultracode', async () => {
+  const { call } = await importFreshModelModule('current-effective-effort')
+  const { AppStateProvider, getDefaultAppState } = await import('../../state/AppState.js')
+  const { render } = await import('../../ink.js')
+  const messages: string[] = []
+  const stdout = new PassThrough()
+  ;(stdout as unknown as { columns: number }).columns = 120
+
+  process.env.CLAUDE_CODE_EFFORT_LEVEL = 'high'
+  const element = await call(
+    result => {
+      if (result) messages.push(result)
+    },
+    {} as never,
+    'current',
+  )
+
+  const instance = await render(
+    <AppStateProvider
+      initialState={{
+        ...getDefaultAppState(),
+        mainLoopModel: 'claude-opus-4-8',
+        effortValue: 'ultracode',
+      }}
+    >
+      {element}
+    </AppStateProvider>,
+    stdout as unknown as NodeJS.WriteStream,
+  )
+
+  await waitForCondition(() => messages.length > 0)
+  instance.unmount()
+  stdout.end()
+
+  expect(messages[0]).toContain('(effort: high)')
+  expect(messages[0]).not.toContain('(effort: ultracode)')
+})
+
+test('/model current resolves effort against the active session model', async () => {
+  const { call } = await importFreshModelModule('current-session-model-effort')
+  const { AppStateProvider, getDefaultAppState } = await import('../../state/AppState.js')
+  const { render } = await import('../../ink.js')
+  const messages: string[] = []
+  const stdout = new PassThrough()
+  ;(stdout as unknown as { columns: number }).columns = 120
+
+  delete process.env.CLAUDE_CODE_EFFORT_LEVEL
+  const element = await call(
+    result => {
+      if (result) messages.push(result)
+    },
+    {} as never,
+    'current',
+  )
+
+  const instance = await render(
+    <AppStateProvider
+      initialState={{
+        ...getDefaultAppState(),
+        mainLoopModel: 'claude-opus-4-8',
+        mainLoopModelForSession: 'claude-sonnet-4-6',
+        effortValue: 'ultracode',
+      }}
+    >
+      {element}
+    </AppStateProvider>,
+    stdout as unknown as NodeJS.WriteStream,
+  )
+
+  await waitForCondition(() => messages.length > 0)
+  instance.unmount()
+  stdout.end()
+
+  expect(messages[0]).toContain('Current model:')
+  expect(messages[0]).toContain('session override from plan mode')
+  expect(messages[0]).toContain('Base model:')
+  expect(messages[0]).toContain('(effort: high)')
+  expect(messages[0]).not.toContain('(effort: xhigh)')
+})
+
+test.each(['sonnet', 'sonnet?reasoning=high'])(
+  '/model rejects Claude alias %s on the active Command Code route',
+  async rejectedModel => {
+    process.env.CLAUDE_CODE_USE_OPENAI = '1'
+    process.env.OPENAI_BASE_URL = 'https://api.commandcode.ai/provider/v1'
+    process.env.OPENAI_MODEL = 'deepseek/deepseek-v4-flash'
+    process.env.CMD_API_KEY = 'cmd-key'
+    delete process.env.COMMANDCODE_API_KEY
+    delete process.env.CLAUDE_CODE_USE_GEMINI
+    delete process.env.CLAUDE_CODE_USE_GITHUB
+    delete process.env.CLAUDE_CODE_USE_MISTRAL
+    delete process.env.CLAUDE_CODE_USE_BEDROCK
+    delete process.env.CLAUDE_CODE_USE_VERTEX
+    delete process.env.CLAUDE_CODE_USE_FOUNDRY
+    delete process.env.OPENAI_API_BASE
+
+    const { call } = await importFreshModelModule(
+      `commandcode-reject-${rejectedModel}`,
+    )
+    const { AppStateProvider, getDefaultAppState } = await import(
+      '../../state/AppState.js'
+    )
+    const { render } = await import('../../ink.js')
+    const messages: string[] = []
+    const stdout = new PassThrough()
+    ;(stdout as unknown as { columns: number }).columns = 120
+
+    const element = await call(
+      result => {
+        if (result) messages.push(result)
+      },
+      {} as never,
+      rejectedModel,
+    )
+
+    const instance = await render(
+      <AppStateProvider
+        initialState={{
+          ...getDefaultAppState(),
+          mainLoopModel: 'deepseek/deepseek-v4-flash',
+        }}
+      >
+        {element}
+      </AppStateProvider>,
+      stdout as unknown as NodeJS.WriteStream,
+    )
+
+    try {
+      await waitForCondition(() => messages.length > 0)
+    } finally {
+      instance.unmount()
+      stdout.end()
+    }
+
+    expect(messages[0]).toContain('requires the Anthropic Messages protocol')
+    expect(messages[0]).not.toContain('Set model to')
+  },
+)
+
+test('/model still applies a Claude alias on a non-Command-Code OpenAI route', async () => {
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL = 'http://127.0.0.1:8080/v1'
+  process.env.OPENAI_MODEL = 'qwen2.5-coder-7b-instruct'
+  delete process.env.CMD_API_KEY
+  delete process.env.COMMANDCODE_API_KEY
+  delete process.env.OPENAI_API_BASE
+  delete process.env.CLAUDE_CODE_USE_GEMINI
+  delete process.env.CLAUDE_CODE_USE_GITHUB
+  delete process.env.CLAUDE_CODE_USE_MISTRAL
+  delete process.env.CLAUDE_CODE_USE_BEDROCK
+  delete process.env.CLAUDE_CODE_USE_VERTEX
+  delete process.env.CLAUDE_CODE_USE_FOUNDRY
+
+  const { call } = await importFreshModelModule('openai-compat-apply-sonnet-alias')
+  const { AppStateProvider, getDefaultAppState } = await import(
+    '../../state/AppState.js'
+  )
+  const { render } = await import('../../ink.js')
+  const messages: string[] = []
+  const stdout = new PassThrough()
+  ;(stdout as unknown as { columns: number }).columns = 120
+
+  const element = await call(
+    result => {
+      if (result) messages.push(result)
+    },
+    {} as never,
+    'sonnet',
+  )
+
+  const instance = await render(
+    <AppStateProvider
+      initialState={{
+        ...getDefaultAppState(),
+        mainLoopModel: 'qwen2.5-coder-7b-instruct',
+      }}
+    >
+      {element}
+    </AppStateProvider>,
+    stdout as unknown as NodeJS.WriteStream,
+  )
+
+  try {
+    await waitForCondition(() => messages.length > 0)
+  } finally {
+    instance.unmount()
+    stdout.end()
+  }
+
+  expect(messages[0]).toContain('Set model to')
+  expect(messages[0]).not.toContain('requires the Anthropic Messages protocol')
 })
 
 test('opens the model picker without awaiting descriptor-backed route refresh', async () => {
@@ -790,7 +1029,7 @@ test('auto profile model picker mode uses explicit multi-model profiles as the p
 test('provider profile model picker surface keeps static route catalogs for single-default profiles', async () => {
   const activeProfile = {
     id: 'opengateway-profile',
-    name: 'Gitlawb Opengateway',
+    name: 'Twigpine Opengateway',
     provider: 'gitlawb-opengateway',
     baseUrl: 'https://opengateway.gitlawb.com/v1',
     model: 'mimo-v2.5-pro',
@@ -816,12 +1055,12 @@ test('provider profile model picker surface keeps static route catalogs for sing
         {
           value: 'mimo-v2.5-pro',
           label: 'MiMo v2.5 Pro',
-          description: 'Recommended · Provider: Gitlawb Opengateway',
+          description: 'Recommended · Provider: Twigpine Opengateway',
         },
         {
           value: 'mimo-v2-pro',
           label: 'MiMo v2 Pro',
-          description: 'Provider: Gitlawb Opengateway',
+          description: 'Provider: Twigpine Opengateway',
         },
       ],
       { profileModelSurface: 'provider' },
@@ -830,12 +1069,12 @@ test('provider profile model picker surface keeps static route catalogs for sing
     {
       value: 'mimo-v2.5-pro',
       label: 'MiMo v2.5 Pro',
-      description: 'Recommended · Provider: Gitlawb Opengateway',
+      description: 'Recommended · Provider: Twigpine Opengateway',
     },
     {
       value: 'mimo-v2-pro',
       label: 'MiMo v2 Pro',
-      description: 'Provider: Gitlawb Opengateway',
+      description: 'Provider: Twigpine Opengateway',
     },
   ])
 })
@@ -1214,6 +1453,18 @@ test('/model applies auto provider surface for single-model descriptor profiles'
           'Recommended · Provider: OpenRouter (openai/gpt-5-mini)',
       },
       {
+        value: 'x-ai/grok-4.6',
+        label: 'Grok 4.6 (via OpenRouter)',
+        description: 'Provider: OpenRouter',
+        descriptionForModel: 'Provider: OpenRouter (x-ai/grok-4.6)',
+      },
+      {
+        value: 'x-ai/grok-4.5',
+        label: 'Grok 4.5 (via OpenRouter)',
+        description: 'Provider: OpenRouter',
+        descriptionForModel: 'Provider: OpenRouter (x-ai/grok-4.5)',
+      },
+      {
         value: activeProfile.model,
         label: activeProfile.model,
         description: 'Provider: OpenRouter',
@@ -1232,10 +1483,156 @@ test('/model applies auto provider surface for single-model descriptor profiles'
   }
 })
 
+test('/model discovery override still surfaces inactive-profile switch options (#1119)', async () => {
+  // Regression for #1164 [P2]: descriptor/legacy discovery contexts pass an
+  // optionsOverride built from the active profile's route models only. Because
+  // the picker uses `optionsOverride ?? getModelOptions()`, the unified switcher
+  // for other configured profiles must be re-appended to the override, or it
+  // disappears entirely for provider-profile discovery paths.
+  const activeProfile = {
+    id: 'openrouter-profile',
+    name: 'OpenRouter',
+    provider: 'openrouter',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    model: 'openai/gpt-oss-120b:free',
+    apiKey: 'sk-openrouter',
+  }
+  const inactiveProfile = {
+    id: 'kimi-profile',
+    name: 'Kimi',
+    provider: 'openai',
+    baseUrl: 'https://api.moonshot.ai/v1',
+    model: 'kimi-k2',
+    apiKey: 'sk-kimi',
+  }
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL = activeProfile.baseUrl
+  process.env.OPENAI_API_KEY = activeProfile.apiKey
+  delete process.env.OPENROUTER_API_KEY
+  process.env.OPENAI_MODEL = activeProfile.model
+  process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED = '1'
+  process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID = activeProfile.id
+  delete process.env.CLAUDE_CODE_USE_GEMINI
+  delete process.env.CLAUDE_CODE_USE_GITHUB
+  delete process.env.CLAUDE_CODE_USE_MISTRAL
+  delete process.env.CLAUDE_CODE_USE_BEDROCK
+  delete process.env.CLAUDE_CODE_USE_VERTEX
+  delete process.env.CLAUDE_CODE_USE_FOUNDRY
+  delete process.env.OPENAI_API_BASE
+
+  mockDescriptorDiscovery({
+    cachedModels: [{ id: 'profile-model', apiName: activeProfile.model }],
+  })
+  mockProviderProfiles({
+    getActiveProviderProfile: () => activeProfile,
+    getProviderProfiles: () => [activeProfile, inactiveProfile],
+    getProfileModelOptions: (profile: { model: string; name: string }) => [
+      { value: profile.model, label: profile.model, description: profile.name },
+    ],
+  })
+
+  const rendered = await renderModelCommandWithCapturedPicker(
+    'descriptor-picker-inactive-switch-options',
+  )
+  try {
+    const override = rendered.getCapturedProps()
+      .optionsOverride as ModelOption[]
+    const switchOptions = override.filter(
+      opt => opt.switchToProfileId !== undefined,
+    )
+    expect(switchOptions.map(opt => opt.switchToProfileId)).toContain(
+      'kimi-profile',
+    )
+    expect(
+      switchOptions.some(
+        opt => opt.value === encodeSwitchProfileValue('kimi-profile', 'kimi-k2'),
+      ),
+    ).toBe(true)
+    // The active profile's own route model is still present as a normal option.
+    expect(
+      override.some(opt => opt.value === activeProfile.model),
+    ).toBe(true)
+  } finally {
+    rendered.instance.unmount()
+    rendered.stdout.end()
+  }
+})
+
 test('/model applies auto provider surface for single-model static descriptor profiles', async () => {
   const activeProfile = {
     id: 'opengateway-profile',
-    name: 'Gitlawb Opengateway',
+    name: 'Twigpine Opengateway',
+    provider: 'gitlawb-opengateway',
+    baseUrl: 'https://opengateway.gitlawb.com/v1',
+    model: 'mimo-v2.5-pro',
+    apiKey: 'sk-opengateway',
+  }
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL = activeProfile.baseUrl
+  process.env.OPENAI_API_KEY = activeProfile.apiKey
+  process.env.OPENAI_MODEL = activeProfile.model
+  process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED = '1'
+  process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID = activeProfile.id
+  delete process.env.OPENROUTER_API_KEY
+  delete process.env.CLAUDE_CODE_USE_GEMINI
+  delete process.env.CLAUDE_CODE_USE_GITHUB
+  delete process.env.CLAUDE_CODE_USE_MISTRAL
+  delete process.env.CLAUDE_CODE_USE_BEDROCK
+  delete process.env.CLAUDE_CODE_USE_VERTEX
+  delete process.env.CLAUDE_CODE_USE_FOUNDRY
+  delete process.env.OPENAI_API_BASE
+
+  mockProviderProfiles({
+    getActiveProviderProfile: () => activeProfile,
+  })
+  mockDescriptorDiscovery({
+    cachedModels: [],
+    routeId: 'gitlawb-opengateway',
+  })
+
+  // Pin the clock inside the Ling Tiny availability window (its catalog
+  // entry expires via availableUntil on 2026-08-13T10:00Z) so this expected
+  // list stays deterministic after that date passes in real time.
+  setSystemTime(new Date('2026-08-12T00:00:00Z'))
+  try {
+    const rendered = await renderModelCommandWithCapturedPicker(
+      'descriptor-picker-auto-provider-static-mode',
+    )
+    try {
+      expect(
+        (rendered.getCapturedProps().optionsOverride as ModelOption[]).map(
+          option => option.value,
+        ),
+      ).toEqual([
+        'auto',
+        'mimo-v2.5-pro',
+        'mimo-v2.5',
+        'mimo-v2-flash',
+        'google/gemini-3.1-flash-lite',
+        'minimax/minimax-m3',
+        'qwen/qwen3.7-max',
+        'z-ai/glm-5.2',
+        'nvidia/nemotron-3-ultra-550b-a55b:free',
+        'nvidia/nemotron-3-ultra-550b-a55b',
+        'inclusionai/ling-3.0-flash',
+        'inclusionai/ling-3.0-tiny:free',
+        'mindai/macaron-v1-tall',
+        'mindai/macaron-v1-venti',
+        'tencent/hy3',
+      ])
+    } finally {
+      rendered.instance.unmount()
+      rendered.stdout.end()
+    }
+  } finally {
+    setSystemTime()
+  }
+})
+
+test('/model drops expired availableUntil entries from the static picker after the cutoff', async () => {
+  const activeProfile = {
+    id: 'opengateway-profile',
+    name: 'Twigpine Opengateway',
     provider: 'gitlawb-opengateway',
     baseUrl: 'https://opengateway.gitlawb.com/v1',
     model: 'mimo-v2.5-pro',
@@ -1260,15 +1657,74 @@ test('/model applies auto provider surface for single-model static descriptor pr
     getActiveProviderProfile: () => activeProfile,
   })
 
+  // Just past the Ling Tiny window (availableUntil 2026-08-13T10:00Z): the
+  // picker must not offer the id the gateway now rejects with a 400.
+  setSystemTime(new Date('2026-08-13T10:00:01Z'))
+  try {
+    const rendered = await renderModelCommandWithCapturedPicker(
+      'descriptor-picker-expired-entry-hidden',
+    )
+    try {
+      const values = (
+        rendered.getCapturedProps().optionsOverride as ModelOption[]
+      ).map(option => option.value)
+      expect(values).not.toContain('inclusionai/ling-3.0-tiny:free')
+      // The rest of the static catalog is untouched by the expiry.
+      expect(values).toContain('inclusionai/ling-3.0-flash')
+      expect(values).toContain('nvidia/nemotron-3-ultra-550b-a55b:free')
+    } finally {
+      rendered.instance.unmount()
+      rendered.stdout.end()
+    }
+  } finally {
+    setSystemTime()
+  }
+})
+
+test('/model merges non-empty OpenGateway discovery cache with curated entries without duplicate MiMo rows', async () => {
+  const activeProfile = {
+    id: 'opengateway-profile',
+    name: 'Twigpine Opengateway',
+    provider: 'gitlawb-opengateway',
+    baseUrl: 'https://opengateway.gitlawb.com/v1',
+    model: 'mimo-v2.5-pro',
+    apiKey: 'sk-opengateway',
+  }
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL = activeProfile.baseUrl
+  process.env.OPENAI_API_KEY = activeProfile.apiKey
+  process.env.OPENAI_MODEL = activeProfile.model
+  process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED = '1'
+  process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID = activeProfile.id
+  delete process.env.OPENROUTER_API_KEY
+  delete process.env.CLAUDE_CODE_USE_GEMINI
+  delete process.env.CLAUDE_CODE_USE_GITHUB
+  delete process.env.CLAUDE_CODE_USE_MISTRAL
+  delete process.env.CLAUDE_CODE_USE_BEDROCK
+  delete process.env.CLAUDE_CODE_USE_VERTEX
+  delete process.env.CLAUDE_CODE_USE_FOUNDRY
+  delete process.env.OPENAI_API_BASE
+
+  mockProviderProfiles({
+    getActiveProviderProfile: () => activeProfile,
+  })
+  mockDescriptorDiscovery({
+    cachedModels: [
+      { id: 'mimo-v2.5-pro', apiName: 'mimo-v2.5-pro', label: 'MiMo V2.5 Pro' },
+      { id: 'xiaomi/mimo-v2.5-pro', apiName: 'mimo-v2.5-pro', label: 'MiMo V2.5 Pro Raw' },
+      { id: 'moonshotai/kimi-k3', apiName: 'moonshotai/kimi-k3', label: 'Kimi K3 (via Opengateway)' },
+    ],
+    routeId: 'gitlawb-opengateway',
+  })
+
   const rendered = await renderModelCommandWithCapturedPicker(
-    'descriptor-picker-auto-provider-static-mode',
+    'descriptor-picker-auto-provider-hybrid-mode',
   )
   try {
-    expect(
-      (rendered.getCapturedProps().optionsOverride as ModelOption[]).map(
-        option => option.value,
-      ),
-    ).toEqual([
+    const optionValues = (
+      rendered.getCapturedProps().optionsOverride as ModelOption[]
+    ).map(option => option.value)
+    expect(optionValues).toEqual([
       'auto',
       'mimo-v2.5-pro',
       'mimo-v2.5',
@@ -1276,8 +1732,95 @@ test('/model applies auto provider surface for single-model static descriptor pr
       'google/gemini-3.1-flash-lite',
       'minimax/minimax-m3',
       'qwen/qwen3.7-max',
+      'z-ai/glm-5.2',
       'nvidia/nemotron-3-ultra-550b-a55b:free',
+      'nvidia/nemotron-3-ultra-550b-a55b',
+      'inclusionai/ling-3.0-flash',
+      'mindai/macaron-v1-tall',
+      'mindai/macaron-v1-venti',
+      'tencent/hy3',
+      'moonshotai/kimi-k3',
     ])
+    // Verify mimo-v2.5-pro appears exactly once (curated entry wins, duplicate is discarded)
+    expect(optionValues.filter(val => val === 'mimo-v2.5-pro')).toHaveLength(1)
+  } finally {
+    rendered.instance.unmount()
+    rendered.stdout.end()
+  }
+})
+
+test('/model OpenGateway interactive refresh preserves availability filter and hides expired models', async () => {
+  const activeProfile = {
+    id: 'opengateway-profile',
+    name: 'Twigpine Opengateway',
+    provider: 'gitlawb-opengateway',
+    baseUrl: 'https://opengateway.gitlawb.com/v1',
+    model: 'auto',
+    apiKey: '',
+  }
+  process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED = '1'
+  process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID = activeProfile.id
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL = activeProfile.baseUrl
+  process.env.OPENAI_MODEL = 'auto'
+  delete process.env.OPENAI_API_KEY
+  delete process.env.OPENGATEWAY_API_KEY
+  delete process.env.CLAUDE_CODE_USE_GEMINI
+  delete process.env.CLAUDE_CODE_USE_GITHUB
+  delete process.env.CLAUDE_CODE_USE_MISTRAL
+  delete process.env.CLAUDE_CODE_USE_BEDROCK
+  delete process.env.CLAUDE_CODE_USE_VERTEX
+  delete process.env.CLAUDE_CODE_USE_FOUNDRY
+  delete process.env.OPENAI_API_BASE
+
+  mockProviderProfiles({
+    getActiveProviderProfile: () => activeProfile,
+  })
+  mockDescriptorDiscovery({
+    cachedModels: [
+      { id: 'mimo-v2.5-pro', apiName: 'mimo-v2.5-pro', label: 'MiMo V2.5 Pro' },
+      { id: 'inclusionai/ling-3.0-tiny:free', apiName: 'inclusionai/ling-3.0-tiny:free', label: 'Ling 3.0 Tiny Live' },
+      { id: 'moonshotai/kimi-k3', apiName: 'moonshotai/kimi-k3', label: 'Kimi K3' },
+    ],
+    discoveredModels: [
+      { id: 'mimo-v2.5-pro', apiName: 'mimo-v2.5-pro', label: 'MiMo V2.5 Pro' },
+      { id: 'inclusionai/ling-3.0-tiny:free', apiName: 'inclusionai/ling-3.0-tiny:free', label: 'Ling 3.0 Tiny Live' },
+      { id: 'moonshotai/kimi-k3', apiName: 'moonshotai/kimi-k3', label: 'Kimi K3' },
+      {
+        id: 'refresh-only/live-model',
+        apiName: 'refresh-only/live-model',
+        label: 'Refresh Only Live Model',
+      },
+    ],
+    routeId: 'gitlawb-opengateway',
+  })
+
+  const rendered = await renderModelCommandWithCapturedPicker(
+    'opengateway-picker-refresh-availability',
+  )
+  try {
+    const initialValues = (
+      rendered.getCapturedProps().optionsOverride as ModelOption[]
+    ).map(option => option.value)
+    expect(initialValues).not.toContain('inclusionai/ling-3.0-tiny:free')
+    expect(initialValues).toContain('moonshotai/kimi-k3')
+    expect(initialValues).not.toContain('refresh-only/live-model')
+
+    const onRefresh = rendered.getCapturedProps().onRefresh
+    expect(onRefresh).toEqual(expect.any(Function))
+    onRefresh!()
+    await waitForCondition(() =>
+      (
+        rendered.getCapturedProps().optionsOverride as ModelOption[]
+      ).some(option => option.value === 'refresh-only/live-model'),
+    )
+
+    const refreshedValues = (
+      rendered.getCapturedProps().optionsOverride as ModelOption[]
+    ).map(option => option.value)
+    expect(refreshedValues).not.toContain('inclusionai/ling-3.0-tiny:free')
+    expect(refreshedValues).toContain('moonshotai/kimi-k3')
+    expect(refreshedValues).toContain('refresh-only/live-model')
   } finally {
     rendered.instance.unmount()
     rendered.stdout.end()
@@ -1334,6 +1877,18 @@ test('/model applies providerProfileModelPickerMode provider override on descrip
         description: 'Recommended · Provider: OpenRouter',
         descriptionForModel:
           'Recommended · Provider: OpenRouter (openai/gpt-5-mini)',
+      },
+      {
+        value: 'x-ai/grok-4.6',
+        label: 'Grok 4.6 (via OpenRouter)',
+        description: 'Provider: OpenRouter',
+        descriptionForModel: 'Provider: OpenRouter (x-ai/grok-4.6)',
+      },
+      {
+        value: 'x-ai/grok-4.5',
+        label: 'Grok 4.5 (via OpenRouter)',
+        description: 'Provider: OpenRouter',
+        descriptionForModel: 'Provider: OpenRouter (x-ai/grok-4.5)',
       },
       {
         value: 'openai/gpt-oss-120b:free',
@@ -2193,6 +2748,145 @@ test('descriptor model options ignore active profile when route does not match',
   ])
 })
 
+test('/model refresh passes first pooled OpenAI credential to descriptor discovery', async () => {
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL = 'https://openrouter.ai/api/v1'
+  process.env.OPENAI_API_KEYS = 'key-a,key-b'
+  delete process.env.OPENAI_API_KEY
+  delete process.env.OPENROUTER_API_KEY
+  process.env.OPENAI_MODEL = 'gpt-5.5'
+  delete process.env.CLAUDE_CODE_USE_GEMINI
+  delete process.env.CLAUDE_CODE_USE_GITHUB
+  delete process.env.CLAUDE_CODE_USE_MISTRAL
+  delete process.env.CLAUDE_CODE_USE_BEDROCK
+  delete process.env.CLAUDE_CODE_USE_VERTEX
+  delete process.env.CLAUDE_CODE_USE_FOUNDRY
+  delete process.env.OPENAI_API_BASE
+
+  const discoverModelsForRoute = mock(async () => ({
+    routeId: 'openrouter',
+    models: [{ id: 'gpt-5.5', apiName: 'gpt-5.5' }],
+    stale: false,
+    error: null,
+    source: 'network',
+  }))
+
+  mock.module('../../integrations/discoveryCache.js', () => ({
+    clearDiscoveryCache: mock(async () => {}),
+    getCachedModels: mock(async () => ({
+      models: [{ id: 'cached-gpt', apiName: 'gpt-5.5' }],
+      updatedAt: Date.now(),
+      error: null,
+    })),
+    isCacheStale: mock(async () => false),
+    parseDurationString: (value: number | string) =>
+      typeof value === 'number' ? value : 86_400_000,
+  }))
+
+  mock.module('../../integrations/discoveryService.js', () => ({
+    getDiscoveryCacheKey: (
+      routeId: string,
+      options?: { apiKey?: string; baseUrl?: string; headers?: Record<string, string> },
+    ) => `${routeId}|${options?.baseUrl ?? ''}|${options?.apiKey ?? ''}|${JSON.stringify(options?.headers ?? {})}`,
+    discoverModelsForRoute,
+    probeRouteReadiness: mock(async () => null),
+  }))
+
+  mockProviderProfiles({
+    getActiveOpenAIModelOptionsCache: () => [],
+    getActiveProviderProfile: () => undefined,
+    getProfileModelOptions: () => [],
+    setActiveOpenAIModelOptionsCache: () => {},
+  })
+
+  const { call } = await importFreshModelModule(
+    'descriptor-refresh-openai-pooled-key',
+  )
+  await call(() => {}, {} as never, 'refresh')
+
+  expect(discoverModelsForRoute).toHaveBeenCalledWith('openrouter', {
+    apiKey: 'key-a',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    headers: undefined,
+    forceRefresh: true,
+  })
+})
+
+test('/model refresh uses OPENAI_API_BASE for Command Code discovery', async () => {
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL = '   '
+  process.env.OPENAI_API_BASE = 'https://api.commandcode.ai/provider/v1'
+  process.env.CMD_API_KEY = 'cmd-key'
+  delete process.env.COMMANDCODE_API_KEY
+  delete process.env.OPENAI_API_KEY
+  delete process.env.OPENAI_API_KEYS
+  process.env.OPENAI_MODEL = 'deepseek/deepseek-v4-flash'
+  delete process.env.CLAUDE_CODE_USE_GEMINI
+  delete process.env.CLAUDE_CODE_USE_GITHUB
+  delete process.env.CLAUDE_CODE_USE_MISTRAL
+  delete process.env.CLAUDE_CODE_USE_BEDROCK
+  delete process.env.CLAUDE_CODE_USE_VERTEX
+  delete process.env.CLAUDE_CODE_USE_FOUNDRY
+
+  const discoverModelsForRoute = mock(async () => ({
+    routeId: 'commandcode',
+    models: [
+      {
+        id: 'deepseek/deepseek-v4-flash',
+        apiName: 'deepseek/deepseek-v4-flash',
+      },
+    ],
+    stale: false,
+    error: null,
+    source: 'network',
+  }))
+
+  mock.module('../../integrations/discoveryCache.js', () => ({
+    clearDiscoveryCache: mock(async () => {}),
+    getCachedModels: mock(async () => ({
+      models: [],
+      updatedAt: Date.now(),
+      error: null,
+    })),
+    isCacheStale: mock(async () => false),
+    parseDurationString: (value: number | string) =>
+      typeof value === 'number' ? value : 86_400_000,
+  }))
+
+  mock.module('../../integrations/discoveryService.js', () => ({
+    getDiscoveryCacheKey: (
+      routeId: string,
+      options?: {
+        apiKey?: string
+        baseUrl?: string
+        headers?: Record<string, string>
+      },
+    ) =>
+      `${routeId}|${options?.baseUrl ?? ''}|${options?.apiKey ?? ''}|${JSON.stringify(options?.headers ?? {})}`,
+    discoverModelsForRoute,
+    probeRouteReadiness: mock(async () => null),
+  }))
+
+  mockProviderProfiles({
+    getActiveOpenAIModelOptionsCache: () => [],
+    getActiveProviderProfile: () => undefined,
+    getProfileModelOptions: () => [],
+    setActiveOpenAIModelOptionsCache: () => {},
+  })
+
+  const { call } = await importFreshModelModule(
+    'commandcode-refresh-openai-api-base',
+  )
+  await call(() => {}, {} as never, 'refresh')
+
+  expect(discoverModelsForRoute).toHaveBeenCalledWith('commandcode', {
+    apiKey: 'cmd-key',
+    baseUrl: 'https://api.commandcode.ai/provider/v1',
+    headers: undefined,
+    forceRefresh: true,
+  })
+})
+
 test('/model refresh clears descriptor cache and reports updates', async () => {
   process.env.CLAUDE_CODE_USE_OPENAI = '1'
   process.env.OPENAI_BASE_URL = 'https://openrouter.ai/api/v1'
@@ -2358,6 +3052,91 @@ test('/model refresh reports discovered model changes for dynamic active profile
   )
 
   expect(messages).toContain('Updated LM Studio models.')
+})
+
+test('/model refresh on OpenGateway does not restore or mention expired models', async () => {
+  const activeProfile = {
+    id: 'opengateway-profile',
+    name: 'Twigpine Opengateway',
+    provider: 'gitlawb-opengateway',
+    baseUrl: 'https://opengateway.gitlawb.com/v1',
+    model: 'auto',
+    apiKey: '',
+  }
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL = activeProfile.baseUrl
+  delete process.env.OPENAI_API_KEY
+  delete process.env.OPENGATEWAY_API_KEY
+  process.env.OPENAI_MODEL = activeProfile.model
+  process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED = '1'
+  process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID = activeProfile.id
+  delete process.env.CLAUDE_CODE_USE_GEMINI
+  delete process.env.CLAUDE_CODE_USE_GITHUB
+  delete process.env.CLAUDE_CODE_USE_MISTRAL
+  delete process.env.CLAUDE_CODE_USE_BEDROCK
+  delete process.env.CLAUDE_CODE_USE_VERTEX
+  delete process.env.CLAUDE_CODE_USE_FOUNDRY
+  delete process.env.OPENAI_API_BASE
+
+  mock.module('../../integrations/discoveryCache.js', () => ({
+    clearDiscoveryCache: mock(async () => {}),
+    getCachedModels: mock(async () => ({
+      models: [{ id: 'mimo-v2.5-pro', apiName: 'mimo-v2.5-pro' }],
+      updatedAt: Date.now(),
+      error: null,
+    })),
+    isCacheStale: mock(async () => false),
+    parseDurationString: (value: number | string) =>
+      typeof value === 'number' ? value : 86_400_000,
+  }))
+
+  mock.module('../../integrations/discoveryService.js', () => ({
+    getDiscoveryCacheKey: (
+      routeId: string,
+      options?: { apiKey?: string; baseUrl?: string; headers?: Record<string, string> },
+    ) => `${routeId}|${options?.baseUrl ?? ''}|${options?.apiKey ?? ''}|${JSON.stringify(options?.headers ?? {})}`,
+    discoverModelsForRoute: mock(async () => {
+      const rawStatic = getRouteDescriptor('gitlawb-opengateway')?.catalog?.models ?? []
+      const discovered = [
+        { id: 'mimo-v2.5-pro', apiName: 'mimo-v2.5-pro' },
+        { id: 'moonshotai/kimi-k3', apiName: 'moonshotai/kimi-k3' },
+        { id: 'inclusionai/ling-3.0-tiny:free', apiName: 'inclusionai/ling-3.0-tiny:free' },
+      ] as ModelCatalogEntry[]
+      const merged = filterAvailableCatalogEntries(
+        mergeRouteCatalogEntries(rawStatic, discovered),
+      )
+      return {
+        routeId: 'gitlawb-opengateway',
+        models: merged,
+        stale: false,
+        error: null,
+        source: 'network',
+      }
+    }),
+    probeRouteReadiness: mock(async () => null),
+  }))
+
+  mockProviderProfiles({
+    getActiveOpenAIModelOptionsCache: () => [],
+    getActiveProviderProfile: () => activeProfile,
+  })
+
+  const messages: string[] = []
+  const { call } = await importFreshModelModule(
+    'opengateway-refresh-summary-no-expired',
+  )
+  await call(
+    (message?: string) => {
+      if (message) {
+        messages.push(message)
+      }
+    },
+    {} as never,
+    'refresh',
+  )
+
+  expect(messages).toContain('Updated Twigpine Opengateway models.')
+  expect(messages.join(' ')).not.toContain('inclusionai/ling-3.0-tiny:free')
 })
 
 test('/model refresh compares already allowlist-filtered descriptor options', async () => {
@@ -2663,3 +3442,529 @@ test('/model does not auto-refresh descriptor models when nonessential traffic i
   expect(result).toBeTruthy()
   expect(discoverModelsForRoute).not.toHaveBeenCalled()
 })
+
+test('cross-profile /model switch drops latched fast mode before activating an unsupported target profile (#1119)', async () => {
+  // Fast mode is enabled on the source provider; activating the target profile
+  // flips isFastModeEnabled() to false (the new provider can't use fast mode).
+  // This guards the ordering bug: reconcileFastModeForSwitch must evaluate
+  // against the source provider (before activation), otherwise it short-circuits
+  // to 'unchanged' once the new provider is active and leaves fastMode latched.
+  let targetProfileActivated = false
+  mock.module('../../utils/fastMode.js', () => ({
+    ...REAL_FAST_MODE_FOR_MODEL_TEST,
+    isFastModeEnabled: () => !targetProfileActivated,
+    isFastModeSupportedByModel: (m: string | null) => m === 'claude-opus-4-7',
+    isFastModeAvailable: () => true,
+    clearFastModeCooldown: () => {},
+  }))
+  mockProviderProfiles({
+    getProviderProfiles: () => [
+      {
+        id: 'profile_openai',
+        name: 'OpenAI',
+        provider: 'openai',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-5-mini',
+      },
+    ],
+    setActiveProviderProfile: (profileId: string) => {
+      targetProfileActivated = true
+      return {
+        id: profileId,
+        name: 'OpenAI',
+        provider: 'openai',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-5-mini',
+      }
+    },
+  } as never)
+
+  let capturedOnSelect:
+    | ((model: string | null, effort: unknown, switchToProfileId?: string) => void)
+    | undefined
+  mock.module('../../components/ModelPicker.js', () => ({
+    ModelPicker: function MockModelPicker(props: {
+      onSelect?: (
+        model: string | null,
+        effort: unknown,
+        switchToProfileId?: string,
+      ) => void
+    }): React.ReactNode {
+      capturedOnSelect = props.onSelect
+      return null
+    },
+  }))
+
+  const { getDefaultAppState } = await import('../../state/AppState.js')
+  const observedStates: Array<{ fastMode?: boolean }> = []
+  const { call } = await importFreshModelModule('fast-cross-profile-order')
+  const element = await call(() => {}, {} as never, '')
+  const { AppStateProvider } = await import('../../state/AppState.js')
+  const { render } = await import('../../ink.js')
+  const stdout = new PassThrough()
+  ;(stdout as unknown as { columns: number }).columns = 120
+  const instance = await render(
+    <AppStateProvider
+      initialState={
+        {
+          ...getDefaultAppState(),
+          fastMode: true,
+          mainLoopModel: 'claude-opus-4-7',
+        } as never
+      }
+      onChangeAppState={({
+        newState,
+      }: {
+        newState: { fastMode?: boolean }
+      }) => {
+        observedStates.push(newState)
+      }}
+    >
+      {element}
+    </AppStateProvider>,
+    stdout as unknown as NodeJS.WriteStream,
+  )
+
+  try {
+    await waitForCondition(() => capturedOnSelect !== undefined)
+    capturedOnSelect?.(
+      encodeSwitchProfileValue('profile_openai', 'gpt-5-mini'),
+      undefined,
+      // The real ModelPicker threads the selected switch option's marker; the
+      // mock picker mirrors that so handleSelect activates the profile.
+      'profile_openai',
+    )
+
+    await waitForCondition(() =>
+      observedStates.some(state => state.fastMode === false),
+    )
+    expect(observedStates.at(-1)?.fastMode).toBe(false)
+  } finally {
+    instance.unmount()
+    // Restore the real fast-mode module for sibling tests in this file.
+    mock.module('../../utils/fastMode.js', () => REAL_FAST_MODE_FOR_MODEL_TEST)
+  }
+})
+
+test('cross-profile /model switch drops fast mode when the target provider cannot run it even though the model name passes source-side support (#1119)', async () => {
+  // jatmn review edge case: the target model name passes isFastModeSupportedByModel
+  // on the SOURCE provider, so the pre-activation reconcile returns 'on'. But the
+  // target provider cannot run fast mode (isFastModeEnabled() flips false after
+  // activation). The post-activation re-check must still force fastMode off rather
+  // than leaving it latched and printing "Fast mode ON".
+  let targetProfileActivated = false
+  mock.module('../../utils/fastMode.js', () => ({
+    ...REAL_FAST_MODE_FOR_MODEL_TEST,
+    // Model name passes support on both sides; only the provider gating changes.
+    isFastModeSupportedByModel: () => true,
+    isFastModeAvailable: () => true,
+    isFastModeEnabled: () => !targetProfileActivated,
+    clearFastModeCooldown: () => {},
+  }))
+  mockProviderProfiles({
+    getProviderProfiles: () => [
+      {
+        id: 'profile_shim',
+        name: 'Custom Shim',
+        provider: 'openai',
+        baseUrl: 'https://shim.example/v1',
+        model: 'claude-opus-4-6',
+      },
+    ],
+    setActiveProviderProfile: (profileId: string) => {
+      targetProfileActivated = true
+      return {
+        id: profileId,
+        name: 'Custom Shim',
+        provider: 'openai',
+        baseUrl: 'https://shim.example/v1',
+        model: 'claude-opus-4-6',
+      }
+    },
+  } as never)
+
+  let capturedOnSelect:
+    | ((model: string | null, effort: unknown, switchToProfileId?: string) => void)
+    | undefined
+  mock.module('../../components/ModelPicker.js', () => ({
+    ModelPicker: function MockModelPicker(props: {
+      onSelect?: (
+        model: string | null,
+        effort: unknown,
+        switchToProfileId?: string,
+      ) => void
+    }): React.ReactNode {
+      capturedOnSelect = props.onSelect
+      return null
+    },
+  }))
+
+  const { getDefaultAppState } = await import('../../state/AppState.js')
+  const observedStates: Array<{ fastMode?: boolean }> = []
+  const { call } = await importFreshModelModule('fast-cross-profile-capability')
+  const element = await call(() => {}, {} as never, '')
+  const { AppStateProvider } = await import('../../state/AppState.js')
+  const { render } = await import('../../ink.js')
+  const stdout = new PassThrough()
+  ;(stdout as unknown as { columns: number }).columns = 120
+  const instance = await render(
+    <AppStateProvider
+      initialState={
+        {
+          ...getDefaultAppState(),
+          fastMode: true,
+          mainLoopModel: 'claude-opus-4-6',
+        } as never
+      }
+      onChangeAppState={({
+        newState,
+      }: {
+        newState: { fastMode?: boolean }
+      }) => {
+        observedStates.push(newState)
+      }}
+    >
+      {element}
+    </AppStateProvider>,
+    stdout as unknown as NodeJS.WriteStream,
+  )
+
+  try {
+    await waitForCondition(() => capturedOnSelect !== undefined)
+    capturedOnSelect?.(
+      encodeSwitchProfileValue('profile_shim', 'claude-opus-4-6'),
+      undefined,
+      // The real ModelPicker threads the selected switch option's marker; the
+      // mock picker mirrors that so handleSelect activates the profile.
+      'profile_shim',
+    )
+
+    await waitForCondition(() =>
+      observedStates.some(state => state.fastMode === false),
+    )
+    expect(observedStates.at(-1)?.fastMode).toBe(false)
+  } finally {
+    instance.unmount()
+    mock.module('../../utils/fastMode.js', () => REAL_FAST_MODE_FOR_MODEL_TEST)
+  }
+})
+
+test('cross-profile /model switch surfaces the selected effort and extra-usage notice (#1119)', async () => {
+  // jatmn review: the cross-profile branch built its own confirmation and
+  // returned before the regular `/model` logic that appends the selected effort
+  // and the cost-impacting `Billed as extra usage` notice. Selecting a target
+  // through an inactive profile must show the same feedback the direct model
+  // path does.
+  mock.module('../../utils/extraUsage.js', () => ({
+    ...REAL_EXTRA_USAGE_FOR_MODEL_TEST,
+    isBilledAsExtraUsage: () => true,
+  }))
+  mockProviderProfiles({
+    getProviderProfiles: () => [
+      {
+        id: 'profile_openai',
+        name: 'OpenAI',
+        provider: 'openai',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-5-mini',
+      },
+    ],
+    setActiveProviderProfile: (profileId: string) => ({
+      id: profileId,
+      name: 'OpenAI',
+      provider: 'openai',
+      baseUrl: 'https://api.openai.com/v1',
+      model: 'gpt-5-mini',
+    }),
+  } as never)
+
+  let capturedOnSelect:
+    | ((model: string | null, effort: unknown, switchToProfileId?: string) => void)
+    | undefined
+  mock.module('../../components/ModelPicker.js', () => ({
+    ModelPicker: function MockModelPicker(props: {
+      onSelect?: (
+        model: string | null,
+        effort: unknown,
+        switchToProfileId?: string,
+      ) => void
+    }): React.ReactNode {
+      capturedOnSelect = props.onSelect
+      return null
+    },
+  }))
+
+  const { getDefaultAppState } = await import('../../state/AppState.js')
+  let doneMessage: string | undefined
+  const { call } = await importFreshModelModule('cross-profile-confirmation')
+  const element = await call(
+    (message?: string) => {
+      doneMessage = message
+    },
+    {} as never,
+    '',
+  )
+  const { AppStateProvider } = await import('../../state/AppState.js')
+  const { render } = await import('../../ink.js')
+  const stdout = new PassThrough()
+  ;(stdout as unknown as { columns: number }).columns = 120
+  const instance = await render(
+    <AppStateProvider
+      initialState={
+        {
+          ...getDefaultAppState(),
+          fastMode: false,
+          mainLoopModel: 'claude-sonnet-4-6',
+        } as never
+      }
+      onChangeAppState={() => {}}
+    >
+      {element}
+    </AppStateProvider>,
+    stdout as unknown as NodeJS.WriteStream,
+  )
+
+  try {
+    await waitForCondition(() => capturedOnSelect !== undefined)
+    capturedOnSelect?.(
+      encodeSwitchProfileValue('profile_openai', 'gpt-5-mini'),
+      'high',
+      // The real ModelPicker threads the selected switch option's marker; the
+      // mock picker mirrors that so handleSelect activates the profile.
+      'profile_openai',
+    )
+
+    await waitForCondition(() => doneMessage !== undefined)
+    expect(doneMessage).toContain('Switched to')
+    expect(doneMessage).toContain('high effort')
+    expect(doneMessage).toContain('Billed as extra usage')
+  } finally {
+    instance.unmount()
+    mock.module('../../utils/extraUsage.js', () => REAL_EXTRA_USAGE_FOR_MODEL_TEST)
+  }
+})
+
+test('cross-profile /model does NOT switch a literal prefixed model id lacking the switch marker (#1164)', async () => {
+  // jatmn [P2]: a real custom model id such as
+  // `__switch_profile__:profile_openai:gpt-5-mini` parses like a switch value
+  // and `profile_openai` exists — but the selected option carried NO
+  // switchToProfileId marker, so it must be applied as a literal model, never
+  // activating the provider. The mock picker mirrors the real one by threading
+  // an UNDEFINED marker for this non-switch option.
+  let activatedProfileId: string | null = null
+  mockProviderProfiles({
+    getProviderProfiles: () => [
+      {
+        id: 'profile_openai',
+        name: 'OpenAI',
+        provider: 'openai',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-5-mini',
+      },
+    ],
+    setActiveProviderProfile: (profileId: string) => {
+      activatedProfileId = profileId
+      return {
+        id: profileId,
+        name: 'OpenAI',
+        provider: 'openai',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-5-mini',
+      }
+    },
+  } as never)
+
+  let capturedOnSelect:
+    | ((model: string | null, effort: unknown, switchToProfileId?: string) => void)
+    | undefined
+  mock.module('../../components/ModelPicker.js', () => ({
+    ModelPicker: function MockModelPicker(props: {
+      onSelect?: (
+        model: string | null,
+        effort: unknown,
+        switchToProfileId?: string,
+      ) => void
+    }): React.ReactNode {
+      capturedOnSelect = props.onSelect
+      return null
+    },
+  }))
+
+  const { getDefaultAppState } = await import('../../state/AppState.js')
+  let doneMessage: string | undefined
+  const { call } = await importFreshModelModule('literal-prefixed-no-switch')
+  const element = await call(
+    (message?: string) => {
+      doneMessage = message
+    },
+    {} as never,
+    '',
+  )
+  const { AppStateProvider } = await import('../../state/AppState.js')
+  const { render } = await import('../../ink.js')
+  const stdout = new PassThrough()
+  ;(stdout as unknown as { columns: number }).columns = 120
+  const instance = await render(
+    <AppStateProvider
+      initialState={
+        {
+          ...getDefaultAppState(),
+          fastMode: false,
+          mainLoopModel: 'claude-sonnet-4-6',
+        } as never
+      }
+      onChangeAppState={() => {}}
+    >
+      {element}
+    </AppStateProvider>,
+    stdout as unknown as NodeJS.WriteStream,
+  )
+
+  try {
+    await waitForCondition(() => capturedOnSelect !== undefined)
+    // Same encoded string, but NO marker threaded — this is a literal custom id.
+    capturedOnSelect?.(
+      encodeSwitchProfileValue('profile_openai', 'gpt-5-mini'),
+      undefined,
+      undefined,
+    )
+
+    await waitForCondition(() => doneMessage !== undefined)
+    // Applied as a literal model, provider never activated.
+    expect(activatedProfileId).toBeNull()
+    expect(doneMessage).not.toContain('Switched to')
+    expect(doneMessage).toContain(
+      encodeSwitchProfileValue('profile_openai', 'gpt-5-mini'),
+    )
+  } finally {
+    instance.unmount()
+  }
+})
+
+for (const state of ['cold', 'warm', 'failed', 'restricted', 'filtered-cold', 'filtered-warm'] as const) {
+  test(`/model remote custom discovery: ${state}`, async () => {
+    process.env.CLAUDE_CODE_USE_OPENAI = '1'
+    process.env.OPENAI_BASE_URL = 'https://custom.example/v1'
+    const filtered = state === 'filtered-cold' || state === 'filtered-warm'
+    process.env.OPENAI_MODEL = filtered ? 'allowed-private-model' : 'selected-model'
+    if (filtered) useSettings({ availableModels: ['allowed-private-model'] })
+    for (const key of [
+      'OPENAI_API_BASE', 'OPENROUTER_API_KEY',
+      'CLAUDE_CODE_USE_GEMINI', 'CLAUDE_CODE_USE_GITHUB',
+      'CLAUDE_CODE_USE_MISTRAL', 'CLAUDE_CODE_USE_BEDROCK',
+      'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY',
+    ]) delete process.env[key]
+    if (state === 'restricted') {
+      process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
+    } else {
+      delete process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+    }
+    const model = { id: 'discovered-model', apiName: filtered ? 'blocked-model' : 'discovered-model', label: 'Discovered model' }
+    mockDescriptorDiscovery({
+      routeId: 'custom',
+      cachedModels: state === 'warm' || state === 'filtered-warm' ? [model] : null,
+      discoveredModels: state === 'failed' ? [] : [model],
+      error: state === 'failed' ? 'Endpoint unavailable' : undefined,
+    })
+    mockProviderProfiles()
+    const { discoverModelsForRoute } = await import('../../integrations/discoveryService.js')
+    const rendered = await renderModelCommandWithCapturedPicker(`remote-custom-${state}`)
+    try {
+      if (state === 'cold' || state === 'failed' || state === 'filtered-cold') {
+        await waitForCondition(() => rendered.getCapturedProps().discoveryState?.tone !== 'info')
+        expect(discoverModelsForRoute).toHaveBeenCalledWith('custom', expect.objectContaining({ forceRefresh: true }))
+      }
+      if (state === 'failed' || state === 'restricted' || filtered) {
+        expect(rendered.getCapturedProps().optionsOverride).toContainEqual(
+          expect.objectContaining({ value: null, label: 'Default (recommended)' }),
+        )
+      } else {
+        expect(rendered.getCapturedProps().optionsOverride).toContainEqual(
+          expect.objectContaining({ value: 'discovered-model', label: 'Discovered model' }),
+        )
+      }
+      if (state === 'failed') {
+        expect(rendered.getCapturedProps().discoveryState?.message).toContain('Endpoint unavailable')
+      }
+      if (state === 'restricted') expect(discoverModelsForRoute).not.toHaveBeenCalled()
+      if (filtered) {
+        rendered.getCapturedProps().onRefresh?.()
+        await waitForCondition(() => rendered.getCapturedProps().discoveryState?.message?.startsWith('No changes found') === true)
+        expect(rendered.getCapturedProps().optionsOverride).toEqual([
+          expect.objectContaining({ value: null, label: 'Default (recommended)' }),
+        ])
+      }
+      let message = ''
+      const { call } = await importFreshModelModule(`remote-custom-refresh-${state}`)
+      await call(value => { message = value ?? '' }, {} as never, 'refresh')
+      expect(message).toContain(
+        state === 'restricted' ? 'disabled' : state === 'failed' ? 'Endpoint unavailable' :
+          state === 'warm' || filtered ? 'No changes found' : 'Updated Custom (OpenAI-compatible) models',
+      )
+    } finally {
+      rendered.instance.unmount()
+      rendered.stdout.end()
+    }
+  })
+}
+
+for (const entryPoint of ['picker', 'slash'] as const) {
+  test(`/model ${entryPoint} refresh preserves a missing key across a profile switch`, async () => {
+    process.env.CLAUDE_CODE_USE_OPENAI = '1'
+    process.env.OPENAI_BASE_URL = 'https://profile-a.example/v1'
+    process.env.OPENAI_MODEL = 'model-a'
+    for (const key of [
+      'OPENAI_API_KEY', 'OPENAI_API_KEYS', 'OPENAI_API_BASE', 'OPENROUTER_API_KEY',
+      'OPENAI_AUTH_HEADER', 'OPENAI_AUTH_HEADER_VALUE', 'OPENAI_AUTH_SCHEME',
+      'CLAUDE_CODE_USE_GEMINI', 'CLAUDE_CODE_USE_GITHUB', 'CLAUDE_CODE_USE_MISTRAL',
+      'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY',
+      'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', 'ANTHROPIC_CUSTOM_HEADERS',
+    ]) delete process.env[key]
+    mockProviderProfiles()
+    mock.module('../../integrations/discoveryService.js', () => REAL_DISCOVERY_SERVICE_FOR_MODEL_TEST)
+    const cached = { models: [{ id: 'model-a', apiName: 'model-a' }], updatedAt: Date.now(), error: null }
+    const clearCache = mock(async () => {
+      // Profile B activates while A's manual refresh is awaiting cache I/O.
+      await Promise.resolve()
+      process.env.OPENAI_BASE_URL = 'https://profile-b.example/v1'
+      process.env.OPENAI_API_KEY = 'profile-b-secret'
+    })
+    mock.module('../../integrations/discoveryCache.js', () => ({
+      clearDiscoveryCache: clearCache,
+      getCachedModels: mock(async () => cached),
+      getCachedModelsSync: () => cached,
+      setCachedModels: mock(async () => {}),
+      recordDiscoveryError: mock(async () => {}),
+      isCacheStale: mock(async () => false),
+      parseDurationString: () => 86_400_000,
+    }))
+    const originalFetch = globalThis.fetch
+    const requests: Array<{ url: string; authorization: string | null }> = []
+    globalThis.fetch = mock(async (input, init) => {
+      requests.push({ url: String(input), authorization: new Headers(init?.headers).get('authorization') })
+      return new Response(JSON.stringify({ data: [{ id: 'model-a' }] }), { status: 200 })
+    }) as unknown as typeof globalThis.fetch
+    let rendered: Awaited<ReturnType<typeof renderModelCommandWithCapturedPicker>> | undefined
+    try {
+      if (entryPoint === 'picker') {
+        rendered = await renderModelCommandWithCapturedPicker('custom-manual-profile-switch')
+        expect(rendered.getCapturedProps().onRefresh).toBeDefined()
+        rendered.getCapturedProps().onRefresh?.()
+        await waitForCondition(() => rendered?.getCapturedProps().discoveryState?.message?.startsWith('No changes found') === true)
+      } else {
+        const { call } = await importFreshModelModule('custom-slash-profile-switch')
+        let message = ''
+        await call(value => { message = value ?? '' }, {} as never, 'refresh')
+        expect(message).toContain('No changes found')
+      }
+      expect(clearCache).toHaveBeenCalledTimes(1)
+      expect(requests).toEqual([{ url: 'https://profile-a.example/v1/models', authorization: null }])
+    } finally {
+      // mock.restore() does not undo module registrations; later tests need disk I/O.
+      mock.module('../../integrations/discoveryCache.js', () => REAL_DISCOVERY_CACHE_FOR_MODEL_TEST)
+      globalThis.fetch = originalFetch
+      rendered?.instance.unmount()
+      rendered?.stdout.end()
+    }
+  })
+}

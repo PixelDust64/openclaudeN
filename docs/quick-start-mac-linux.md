@@ -18,8 +18,19 @@ npm --version
 ## 2. Install OpenClaude
 
 ```bash
-npm install -g @gitlawb/openclaude@latest
+npm install -g @twigpine/openclaude@latest
 ```
+
+Upgrading from `@gitlawb/openclaude`? The package moved to the `@twigpine`
+scope and the old one is no longer updated. npm will not install one over the
+other because both provide the `openclaude` command, so remove the old package
+first:
+
+```bash
+npm uninstall -g @gitlawb/openclaude
+npm install -g @twigpine/openclaude@latest
+```
+
 On Arch Linux, you can alternatively install OpenClaude via the community-maintained [AUR package](https://aur.archlinux.org/packages/openclaude):
 
 ```bash
@@ -71,6 +82,19 @@ openclaude
 ```
 
 No API key is needed for Ollama local models.
+
+OpenClaude asks Ollama for a 32768-token context window on each chat request.
+If you need a different size, set `OPENCLAUDE_OLLAMA_NUM_CTX` before launching
+OpenClaude, or start Ollama with a global context setting:
+
+```bash
+# Stop any existing Ollama app/server first, then run:
+OLLAMA_CONTEXT_LENGTH=32768 ollama serve
+```
+
+After a chat request, run `ollama ps` in another terminal and check the
+`CONTEXT` column. It should show the requested size. If it still shows a small
+value such as `4K`, restart the Ollama app/server and try again.
 
 ### Option D: LM Studio
 
@@ -132,6 +156,8 @@ Check the basics:
 - make sure Ollama is installed
 - make sure Ollama is running
 - make sure the model was pulled successfully
+- if same-session chat history appears missing, verify the active `CONTEXT`
+  value with `ollama ps`; OpenClaude requests 32K by default
 
 ### For LM Studio
 
@@ -145,7 +171,7 @@ Check the basics:
 
 **Via npm:**
 ```bash
-npm install -g @gitlawb/openclaude@latest
+npm install -g @twigpine/openclaude@latest
 ```
 
 **Via AUR:**
@@ -158,7 +184,7 @@ paru
 
 **Via npm:**
 ```bash
-npm uninstall -g @gitlawb/openclaude
+npm uninstall -g @twigpine/openclaude
 ```
 
 **Via AUR (Arch Linux):**

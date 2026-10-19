@@ -8,12 +8,79 @@
  * - src/ path aliases
  */
 
-import { readFileSync } from 'fs'
+import { existsSync, readFileSync } from 'fs'
+import { createRequire } from 'module'
+import { dirname, join } from 'path'
 import { noTelemetryPlugin } from './no-telemetry-plugin'
 import { CLI_EXTERNALS, SDK_EXTERNALS } from './externals.js'
+import { canonicalStub, collectBundleStubs } from './stubMarkerGuard.js'
 
+const nodeRequire = createRequire(import.meta.url)
 const pkg = JSON.parse(readFileSync('./package.json', 'utf-8'))
 const version = pkg.version
+// Baked into the update hints and the doctor checks, so it has to be the
+// name the tarball is actually published under — derive it instead of
+// repeating it.
+const packageName = pkg.name
+const reactPackageDir = dirname(nodeRequire.resolve('react/package.json'))
+const reactReconcilerPackageDir = dirname(
+  nodeRequire.resolve('react-reconciler/package.json'),
+)
+const schedulerPackageDir = dirname(nodeRequire.resolve('scheduler/package.json'))
+const productionReactModules = new Map<string, string>([
+  ['react', join(reactPackageDir, 'cjs/react.production.js')],
+  [
+    'react/jsx-runtime',
+    join(reactPackageDir, 'cjs/react-jsx-runtime.production.js'),
+  ],
+  // NOT react-jsx-dev-runtime.production.js: that file exports
+  // `jsxDEV: undefined` on purpose (production code is expected to use the
+  // non-dev transform), but Bun transpiles our JSX to jsxDEV() calls, so the
+  // real production file would leave every component invoking undefined()
+  // and the UI would never render. The shim dispatches to production
+  // jsx/jsxs; its own `react/jsx-runtime` import is remapped by this plugin.
+  [
+    'react/jsx-dev-runtime',
+    join(import.meta.dir, 'reactJsxDevRuntimeProductionShim.js'),
+  ],
+  [
+    'react-reconciler',
+    join(reactReconcilerPackageDir, 'cjs/react-reconciler.production.js'),
+  ],
+  [
+    'react-reconciler/constants.js',
+    join(
+      reactReconcilerPackageDir,
+      'cjs/react-reconciler-constants.production.js',
+    ),
+  ],
+  ['scheduler', join(schedulerPackageDir, 'cjs/scheduler.production.js')],
+])
+
+for (const [specifier, resolvedPath] of productionReactModules) {
+  if (!existsSync(resolvedPath)) {
+    throw new Error(
+      `productionReactPlugin: expected production file for "${specifier}" not found at ${resolvedPath}. ` +
+        'The installed React package layout may have changed.',
+    )
+  }
+}
+
+const productionReactPlugin = {
+  name: 'production-react-bundle',
+  setup(build) {
+    build.onResolve(
+      {
+        filter:
+          /^(react|react\/jsx-runtime|react\/jsx-dev-runtime|react-reconciler|react-reconciler\/constants\.js|scheduler)$/,
+      },
+      args => {
+        const path = productionReactModules.get(args.path)
+        return path ? { path } : null
+      },
+    )
+  },
+}
 
 // Feature flags for the open build.
 // Most Anthropic-internal features stay off; open-build features can be
@@ -36,6 +103,9 @@ const featureFlags: Record<string, boolean> = {
   CHICAGO_MCP: false,             // Computer-use MCP (native Swift modules stubbed)
   COWORKER_TYPE_TELEMETRY: false, // Telemetry for agent/coworker type classification
   MCP_SKILLS: true,               // Dynamic MCP skill discovery via skill:// resources
+
+  // ── Disabled by default, opt-in via runtime env var ─────────────────
+  REPO_MAP: false,                // Auto-injected codebase intelligence repo-map; users opt in with REPO_MAP=1 (the runtime gate in src/context.ts honors the env var even when this flag is false)
 
   // ── Enabled: upstream defaults ──────────────────────────────────────
   COORDINATOR_MODE: true,             // Multi-agent coordinator with worker delegation
@@ -61,6 +131,8 @@ const featureFlags: Record<string, boolean> = {
   VERIFICATION_AGENT: true,           // Built-in read-only agent for test/verification
   PROMPT_CACHE_BREAK_DETECTION: true, // Detect & log unexpected prompt cache invalidations
   HOOK_PROMPTS: true,                 // Allow tools to request interactive user prompts
+  CONVERSATION_ARC: true,             // Conversation arc tracking (goals/decisions/phases)
+  MULTI_TURN_CONTEXT: true,           // Multi-turn context tracking across tool cycles
 }
 
 // ── Pre-process: replace feature() calls with boolean literals ──────
@@ -120,7 +192,11 @@ result = await Bun.build({
   format: 'esm',
   splitting: false,
   sourcemap: 'external',
-  minify: false,
+  // Whitespace+syntax only: identifier mangling would break the
+  // constructor.name matching in errors.ts/toolExecution.ts/useCanUseTool.
+  // The SDK build stays unminified — its React/Ink leak check greps import
+  // syntax that minification would rewrite.
+  minify: { whitespace: true, syntax: true, identifiers: false },
   naming: 'cli.mjs',
   define: {
     // MACRO.* build-time constants
@@ -131,16 +207,17 @@ result = await Bun.build({
     'MACRO.DISPLAY_VERSION': JSON.stringify(version),
     'MACRO.BUILD_TIME': JSON.stringify(new Date().toISOString()),
     'MACRO.ISSUES_EXPLAINER':
-      JSON.stringify('report the issue at https://github.com/Gitlawb/openclaude/issues'),
+      JSON.stringify('report the issue at https://github.com/Twigpine/openclaude/issues'),
     'MACRO.FEEDBACK_CHANNEL':
-      JSON.stringify('https://github.com/Gitlawb/openclaude/issues'),
-    'MACRO.PACKAGE_URL': JSON.stringify('@gitlawb/openclaude'),
+      JSON.stringify('https://github.com/Twigpine/openclaude/issues'),
+    'MACRO.PACKAGE_URL': JSON.stringify(packageName),
     'MACRO.NATIVE_PACKAGE_URL': 'undefined',
     'MACRO.VERSION_CHANGELOG': 'undefined',
   },
   plugins: [
     noTelemetryPlugin,
     featureFlagPreprocessPlugin,
+    productionReactPlugin,
     {
       name: 'bun-bundle-shim',
       setup(build) {
@@ -423,9 +500,15 @@ export const createClaudeForChromeMcpServer = noop;
           (args) => {
             const names = missingModuleExports.get(args.path) ?? new Set()
             const exports = [...names].map(n => `export const ${n} = noop;`).join('\n')
+            // The bundle guard used to find Bun's `// missing-module-stub:<path>`
+            // module-boundary comments, but minification strips comments. Emit
+            // the marker as a side-effecting string push instead so treeshaking
+            // and syntax-minify keep the literal in the bundle.
+            const marker = JSON.stringify(`missing-module-stub:${args.path}`)
             return {
               contents: `
 const noop = () => null;
+;(globalThis.__openclaudeStubMarkers ??= []).push(${marker});
 export default noop;
 ${exports}
 `,
@@ -467,10 +550,10 @@ sdkResult = await Bun.build({
     'MACRO.DISPLAY_VERSION': JSON.stringify(version),
     'MACRO.BUILD_TIME': JSON.stringify(new Date().toISOString()),
     'MACRO.ISSUES_EXPLAINER':
-      JSON.stringify('report the issue at https://github.com/Gitlawb/openclaude/issues'),
+      JSON.stringify('report the issue at https://github.com/Twigpine/openclaude/issues'),
     'MACRO.FEEDBACK_CHANNEL':
-      JSON.stringify('https://github.com/Gitlawb/openclaude/issues'),
-    'MACRO.PACKAGE_URL': JSON.stringify('@gitlawb/openclaude'),
+      JSON.stringify('https://github.com/Twigpine/openclaude/issues'),
+    'MACRO.PACKAGE_URL': JSON.stringify(packageName),
     'MACRO.NATIVE_PACKAGE_URL': 'undefined',
     'MACRO.VERSION_CHANGELOG': 'undefined',
   },
@@ -957,29 +1040,15 @@ if (result?.success) {
   // Stub markers are not byte-stable across build hosts: the per-importer
   // scanner records each stub as the resolved absolute source path, which
   // differs only by the repo-root prefix (`/home/ubuntu/.../openclaude` locally
-  // vs `/home/runner/work/openclaude/openclaude` on CI). Diffing raw text made
-  // CI fail on already-allowlisted stubs and report them stale. Key on the
-  // repo-relative path from `src/` onward without extension: stable across hosts
-  // yet still path-specific, so a stub named `constants.ts` in one directory
-  // cannot mask a different `constants.ts` somewhere else (a basename-only key
-  // would).
-  const canonicalStub = (marker: string): string => {
-    const normalized = marker.split(/[\\/]/).join('/')
-    const srcIdx = normalized.lastIndexOf('/src/')
-    const fromSrc = srcIdx >= 0 ? normalized.slice(srcIdx + 1) : normalized
-    return fromSrc.replace(/\.(?:[cm]?[jt]sx?)$/, '')
-  }
-
+  // vs `/home/runner/work/openclaude/openclaude` on CI). canonicalStub() keys
+  // on the repo-relative path from `src/` onward (see scripts/stubMarkerGuard.ts).
   const acceptableCanonical = new Set(
     [...ACCEPTABLE_RUNTIME_STUBS].map(canonicalStub),
   )
 
   const bundleText = await Bun.file('dist/cli.mjs').text()
   // canonical key -> raw marker text (kept for human-readable diagnostics)
-  const stubbed = new Map<string, string>()
-  for (const m of bundleText.matchAll(/\/\/\s*missing-module-stub:(\S+)/g)) {
-    stubbed.set(canonicalStub(m[1]), m[1])
-  }
+  const stubbed = collectBundleStubs(bundleText)
   const unexpected = [...stubbed]
     .filter(([key]) => !acceptableCanonical.has(key))
     .map(([, raw]) => raw)

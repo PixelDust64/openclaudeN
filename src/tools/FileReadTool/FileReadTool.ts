@@ -48,6 +48,10 @@ import {
   ImageResizeError,
   maybeResizeAndDownsampleImageBuffer,
 } from '../../utils/imageResizer.js'
+import {
+  getImageProcessor,
+  ImageProcessorUnavailableError,
+} from './imageProcessor.js'
 import { lazySchema } from '../../utils/lazySchema.js'
 import { logError } from '../../utils/log.js'
 import { isAutoMemFile } from '../../utils/memoryFileDetection.js'
@@ -85,6 +89,7 @@ import {
   OFFSET_INSTRUCTION_TARGETED,
   renderPromptTemplate,
 } from './prompt.js'
+import { checkReadDedup } from './readDedup.js'
 import {
   getToolUseSummary,
   renderToolResultMessage,
@@ -628,35 +633,36 @@ export const FileReadTool = buildTool({
     const existingState = dedupKillswitch
       ? undefined
       : readFileState.get(fullFilePath)
-    // Only dedup entries that came from a prior Read (offset is always set
-    // by Read). Edit/Write store offset=undefined — their readFileState
-    // entry reflects post-edit mtime, so deduping against it would wrongly
-    // point the model at the pre-edit Read content.
-    if (
-      existingState &&
-      !existingState.isPartialView &&
-      existingState.offset !== undefined
-    ) {
-      const rangeMatch =
-        existingState.offset === offset && existingState.limit === limit
-      if (rangeMatch) {
-        try {
-          const mtimeMs = await getFileModificationTimeAsync(fullFilePath)
-          if (mtimeMs === existingState.timestamp) {
-            const analyticsExt = getFileExtensionForAnalytics(fullFilePath)
-            logEvent('tengu_file_read_dedup', {
-              ...(analyticsExt !== undefined && { ext: analyticsExt }),
-            })
-            return {
-              data: {
-                type: 'file_unchanged' as const,
-                file: { filePath: file_path },
-              },
-            }
-          }
-        } catch {
-          // stat failed — fall through to full read
-        }
+    // Hits cover the exact same range, any in-bounds range of a prior full
+    // Read, and files whose mtime moved but whose bytes did not (see
+    // readDedup.ts for the eligibility rules).
+    const dedup = await checkReadDedup(existingState, offset, limit, {
+      getModificationTime: () => getFileModificationTimeAsync(fullFilePath),
+      readRange: (rangeOffset, rangeLimit) =>
+        readFileInRange(
+          fullFilePath,
+          rangeOffset === 0 ? 0 : rangeOffset - 1,
+          rangeLimit,
+          rangeLimit === undefined ? maxSizeBytes : undefined,
+          context.abortController.signal,
+        ),
+    })
+    if (dedup.kind !== 'miss' && existingState) {
+      if (dedup.kind === 'touched') {
+        readFileState.set(fullFilePath, {
+          ...existingState,
+          timestamp: dedup.timestamp,
+        })
+      }
+      const analyticsExt = getFileExtensionForAnalytics(fullFilePath)
+      logEvent('tengu_file_read_dedup', {
+        ...(analyticsExt !== undefined && { ext: analyticsExt }),
+      })
+      return {
+        data: {
+          type: 'file_unchanged' as const,
+          file: { filePath: file_path },
+        },
       }
     }
 
@@ -817,8 +823,14 @@ function formatFileLines(file: { content: string; startLine: number }): string {
 export const CYBER_RISK_MITIGATION_REMINDER =
   '\n\n<system-reminder>\nWhenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.\n</system-reminder>\n'
 
-// Models where cyber risk mitigation should be skipped
-const MITIGATION_EXEMPT_MODELS = new Set(['claude-opus-4-6'])
+// Models where cyber risk mitigation should be skipped. The recent Opus models
+// (4.8/4.7) inherit 4.6's exemption — 4.8 is now the first-party default, so
+// without this it would get the reminder on every file read that 4.6 did not.
+const MITIGATION_EXEMPT_MODELS = new Set([
+  'claude-opus-4-8',
+  'claude-opus-4-7',
+  'claude-opus-4-6',
+])
 
 function shouldIncludeFileReadMitigation(): boolean {
   if (isEnvTruthy(process.env.OPENCLAUDE_DISABLE_TOOL_REMINDERS)) {
@@ -1255,15 +1267,13 @@ export async function readImageWithTokenBudget(
       }
     } catch (e) {
       logError(e)
-      // Fallback: heavily compressed version from the SAME buffer
+      // Fallback: heavily compressed version from the SAME buffer, loaded via
+      // the shared optional image processor (NOT a raw import('sharp')). This
+      // keeps the missing-image-processor contract: when no processor is
+      // installed, surface the actionable install hint instead of swallowing it
+      // and returning an image that already exceeded the token budget.
       try {
-        const sharpModule = await import('sharp')
-        // CJS/ESM interop: prefer .default; some loaders expose the callable
-        // as the module itself, hence the cast on the fallback.
-        const sharp =
-          sharpModule.default ||
-          (sharpModule as unknown as typeof sharpModule.default)
-
+        const sharp = await getImageProcessor()
         const fallbackBuffer = await sharp(imageBuffer)
           .resize(400, 400, {
             fit: 'inside',
@@ -1274,6 +1284,10 @@ export async function readImageWithTokenBudget(
 
         return createImageResponse(fallbackBuffer, 'jpeg', originalSize)
       } catch (error) {
+        // No image processor available → surface the install hint rather than
+        // returning an over-budget image. Other failures (e.g. a corrupt
+        // buffer) still degrade gracefully to the original.
+        if (error instanceof ImageProcessorUnavailableError) throw error
         logError(error)
         return createImageResponse(imageBuffer, detectedFormat, originalSize)
       }

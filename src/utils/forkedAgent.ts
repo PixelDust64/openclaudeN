@@ -176,6 +176,16 @@ export function createGetAppStateWithAllowedTools(
 }
 
 /**
+ * Captures the untransformed root state before a forked command replaces
+ * getAppState with a command-scoped view (for example, allowed tools).
+ */
+export function createRootAppStateGetter(
+  context: ToolUseContext,
+): NonNullable<ToolUseContext['getRootAppState']> {
+  return () => context.getRootAppState?.() ?? context.getAppState()
+}
+
+/**
  * Result from preparing a forked command context.
  */
 export type PreparedForkedContext = {
@@ -277,6 +287,10 @@ export type SubagentContextOverrides = {
   abortController?: AbortController
   /** Override the getAppState function */
   getAppState?: ToolUseContext['getAppState']
+  /** Override the untransformed root-state getter. */
+  getRootAppState?: NonNullable<ToolUseContext['getRootAppState']>
+  /** Explicitly opt in to sharing a lifecycle tracker with this subagent. */
+  queryLifecycle?: ToolUseContext['queryLifecycle']
 
   /**
    * Explicit opt-in to share parent's setAppState callback.
@@ -356,7 +370,11 @@ export function createSubagentContext(
     overrides?.abortController ??
     (overrides?.shareAbortController
       ? parentContext.abortController
-      : createChildAbortController(parentContext.abortController))
+      : createChildAbortController(parentContext.abortController, undefined, {
+          subsystem: 'forked_agent',
+          controllerRole: 'subagent-context',
+          subagentId: overrides?.agentId,
+        }))
 
   // Determine getAppState - wrap to set shouldAvoidPermissionPrompts unless sharing abortController
   // (if sharing abortController, it's an interactive agent that CAN show UI)
@@ -412,6 +430,11 @@ export function createSubagentContext(
 
     // AppState access
     getAppState,
+    // Permission persistence must use the untransformed root context rather
+    // than agent-local mode, rule scoping, or prompt-control flags.
+    getRootAppState:
+      overrides?.getRootAppState ??
+      (() => parentContext.getRootAppState?.() ?? parentContext.getAppState()),
     setAppState: overrides?.shareSetAppState
       ? parentContext.setAppState
       : () => {},
@@ -452,6 +475,9 @@ export function createSubagentContext(
     // Generate new agentId for subagents (each subagent should have its own ID)
     agentId: overrides?.agentId ?? createAgentId(),
     agentType: overrides?.agentType,
+    ...(overrides?.queryLifecycle
+      ? { queryLifecycle: overrides.queryLifecycle }
+      : {}),
 
     // Create new query tracking chain for subagent with incremented depth
     queryTracking: {

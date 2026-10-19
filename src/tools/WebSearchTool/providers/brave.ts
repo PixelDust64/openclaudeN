@@ -9,6 +9,7 @@
 
 import type { SearchInput, SearchProvider } from './types.js'
 import { applyDomainFilters, safeHostname, type ProviderOutput } from './types.js'
+import { fetchJsonWithWebSearchTimeout } from './timeout.js'
 
 export const braveProvider: SearchProvider = {
   name: 'brave',
@@ -24,25 +25,30 @@ export const braveProvider: SearchProvider = {
     url.searchParams.set('q', input.query)
     url.searchParams.set('count', '15')
 
-    const res = await fetch(url.toString(), {
-      headers: {
-        'X-Subscription-Token': process.env.BRAVE_API_KEY!,
-        Accept: 'application/json',
+    const data = (await fetchJsonWithWebSearchTimeout(
+      url.toString(),
+      {
+        headers: {
+          'X-Subscription-Token': process.env.BRAVE_API_KEY!,
+          Accept: 'application/json',
+        },
       },
       signal,
+      { providerName: 'Brave' },
+    )) as { web?: { results?: unknown } } | undefined
+
+    const rawResults = data?.web?.results
+    const results = Array.isArray(rawResults) ? rawResults : []
+    const hits = (results as unknown[]).map((r) => {
+      const rec = (r ?? {}) as Record<string, unknown>
+      const url = typeof rec.url === 'string' ? rec.url : ''
+      return {
+        title: typeof rec.title === 'string' ? rec.title : '',
+        url,
+        description: typeof rec.description === 'string' ? rec.description : undefined,
+        source: url ? safeHostname(url) : undefined,
+      }
     })
-
-    if (!res.ok) {
-      throw new Error(`Brave search error ${res.status}: ${await res.text().catch(() => '')}`)
-    }
-
-    const data = await res.json()
-    const hits = (data.web?.results ?? []).map((r: any) => ({
-      title: r.title ?? '',
-      url: r.url ?? '',
-      description: r.description,
-      source: r.url ? safeHostname(r.url) : undefined,
-    }))
 
     return {
       hits: applyDomainFilters(hits, input),

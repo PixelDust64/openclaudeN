@@ -23,6 +23,11 @@ import { parseJSONL } from './json.js'
 import { logError } from './log.js'
 import { getAPIProvider } from './model/providers.js'
 import {
+  getGitAttributionOptIns,
+  isGeneratedCommitAttributionBlocked,
+  isGeneratedPrAttributionBlocked,
+} from './governancePolicy.js'
+import {
   getCanonicalName,
   getMainLoopModel,
   getPublicModelDisplayName,
@@ -40,7 +45,7 @@ export type AttributionTexts = {
 }
 
 const DEFAULT_PR_ATTRIBUTION =
-  '🤖 Generated with [OpenClaude](https://github.com/Gitlawb/openclaude)'
+  '🤖 Generated with [OpenClaude](https://github.com/Twigpine/openclaude)'
 
 function sanitizeCoAuthorNamePart(value: string): string {
   return value
@@ -89,7 +94,7 @@ export function getDefaultCommitCoAuthorName({
   // actual configured model instead of claiming Claude Opus.
   if (apiProvider === 'firstParty') {
     // @[MODEL LAUNCH]: Update this fallback when the default public Claude model changes.
-    return 'Claude Opus 4.6'
+    return 'Claude Opus 4.8'
   }
 
   const sanitizedModel = sanitizeCoAuthorNamePart(model)
@@ -137,7 +142,15 @@ export function getAttributionTexts(): AttributionTexts {
     }
   }
 
-  if (settings.includeCoAuthoredBy !== true) {
+  const optIns = getGitAttributionOptIns()
+  const includeGeneratedCommit =
+    (settings.includeCoAuthoredBy === true || optIns.addAICoAuthor) &&
+    !isGeneratedCommitAttributionBlocked()
+  const includeGeneratedPr =
+    (settings.includeCoAuthoredBy === true || optIns.addGeneratedWithFooter) &&
+    !isGeneratedPrAttributionBlocked()
+
+  if (!includeGeneratedCommit && !includeGeneratedPr) {
     return { commit: '', pr: '' }
   }
 
@@ -157,7 +170,10 @@ export function getAttributionTexts(): AttributionTexts {
     ? ''
     : `Co-Authored-By: ${modelName} <${coAuthorEmail}>`
 
-  return { commit: defaultCommit, pr: DEFAULT_PR_ATTRIBUTION }
+  return {
+    commit: includeGeneratedCommit ? defaultCommit : '',
+    pr: includeGeneratedPr ? DEFAULT_PR_ATTRIBUTION : '',
+  }
 }
 
 /**
@@ -387,9 +403,14 @@ export async function getEnhancedPRAttribution(
     return ''
   }
 
-  // Backward compatibility: deprecated includeCoAuthoredBy setting is now an
-  // explicit opt-in for the old generated attribution behavior.
-  if (settings.includeCoAuthoredBy !== true) {
+  const optIns = getGitAttributionOptIns()
+  const includeGeneratedPr =
+    (settings.includeCoAuthoredBy === true || optIns.addGeneratedWithFooter) &&
+    !isGeneratedPrAttributionBlocked()
+
+  // Backward compatibility: deprecated includeCoAuthoredBy remains an explicit
+  // opt-in, and git.addGeneratedWithFooter is the new generated-PR opt-in.
+  if (!includeGeneratedPr) {
     return ''
   }
 
@@ -437,7 +458,7 @@ export async function getEnhancedPRAttribution(
     memoryAccessCount > 0
       ? `, ${memoryAccessCount} ${memoryAccessCount === 1 ? 'memory' : 'memories'} recalled`
       : ''
-  const summary = `🤖 Generated with [OpenClaude](https://github.com/Gitlawb/openclaude) (${claudePercent}% ${promptCount}-shotted by ${shortModelName}${memSuffix})`
+  const summary = `🤖 Generated with [OpenClaude](https://github.com/Twigpine/openclaude) (${claudePercent}% ${promptCount}-shotted by ${shortModelName}${memSuffix})`
 
   // Append trailer lines for squash-merge survival. Only for allowlisted repos
   // (INTERNAL_MODEL_REPOS) and only in builds with COMMIT_ATTRIBUTION enabled —

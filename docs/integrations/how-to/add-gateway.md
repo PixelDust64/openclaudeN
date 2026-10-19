@@ -55,6 +55,18 @@ Normal gateway examples should:
 
 The routing decision belongs to `transportConfig.kind`, not to `category`.
 
+## Reasoning controls in mixed catalogs
+
+Gateway catalogs often mix models with different reasoning APIs. Keep
+`capabilities.supportsReasoning` as descriptive capability metadata unless
+the exact gateway route and model ID have been probed.
+
+Add `/effort`-controllable `reasoning` metadata per catalog entry, not at the
+gateway level. If a gateway accepts one upstream model's `reasoning_effort`
+but rejects another model's field, each entry must say so explicitly. See
+`docs/integrations/reasoning-effort.md` before adding or changing reasoning
+controls.
+
 ## Generated loader and preset manifest
 
 Normal gateway onboarding is additive now:
@@ -362,6 +374,15 @@ that should support `/model refresh` and in-picker refresh. The shared
 discovery cache keeps curated entries visible while refreshes fail or become
 stale.
 
+
+Remote endpoints using the built-in `custom` route also use descriptor discovery
+in `/model`, including initial discovery and `/model refresh`. If no selectable
+models remain after merging configured profile models and applying the allowlist,
+a Default option stays available. Discovery honors `OPENAI_AUTH_HEADER`,
+`OPENAI_AUTH_HEADER_VALUE`, and `OPENAI_AUTH_SCHEME`, using the same auth partition
+for cached runtime limits. Local custom chat-completions endpoints using the
+`openai:` scoped cache retain the legacy picker.
+
 ## `providerModelMap` in mixed gateway catalogs
 
 If the gateway exposes a shared model under a route-specific API name, point
@@ -438,6 +459,13 @@ Use `discoveryRefreshMode` to match the operational shape of the route:
   the normal hosted-gateway choice when cached models should appear immediately;
 - `startup`
   fast local routes where startup probing is cheap and useful.
+
+If an authenticated inference route exposes a public model endpoint, set
+`catalog.discovery.requiresAuth` to `false` while keeping `setup.requiresAuth`
+enabled. OpenRouter and Twigpine Opengateway use this split: model listing is
+keyless, but inference still requires an API key. Avoid combining
+`discoveryRefreshMode: 'startup'` with an `openai-compatible-models` readiness
+probe when both execute the same request, because that doubles startup traffic.
 
 ## `max_tokens` vs `max_completion_tokens`
 
